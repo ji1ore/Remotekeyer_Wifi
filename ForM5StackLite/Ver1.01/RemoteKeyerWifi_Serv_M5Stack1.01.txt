@@ -1,0 +1,586 @@
+/*=============================================================================*
+ * M5Stadk_RemoteKeyerWifi  サーバー用ファームウェア Ver1.01
+ * M5Stack ATOM Lite 対応
+ * Wifiプロファイル選択対応
+ * ダイレクト通信対応
+ * Copyright (C) 2019-2025 JF5SIM / 修正: JI1ORE
+ *=============================================================================*/
+
+#include <WiFi.h>
+#include <WiFiUdp.h>
+#include <Adafruit_NeoPixel.h>
+#include <EEPROM.h>
+#define EEPROM_SIZE 4
+#define EEPROM_ADDR_PROFILE_INDEX 0
+
+// ==== 色設定 ====
+struct ColorProfile
+{
+  const char *name;
+  uint8_t r;
+  uint8_t g;
+  uint8_t b;
+};
+
+ColorProfile MagentaProfile = {"Magenta", 255, 0, 255};
+ColorProfile yellowProfile = {"Yellow", 255, 255, 0};
+ColorProfile cyanProfile = {"Cyan", 0, 255, 255};
+
+// ==== WiFi接続プロファイル（複数対応） ====
+struct ServerProfile
+{
+  const char *ssid;
+  const char *password;
+  IPAddress localIP;
+  IPAddress gateway;
+  IPAddress subnet;
+  bool hasIP;
+  bool isApMode;
+  ColorProfile *color;
+};
+
+ServerProfile serverProfiles[] = {
+    {"LAN-1", "xxxxxxxx",
+     IPAddress(192, 168, 0, 50), IPAddress(192, 168, 0, 1), IPAddress(255, 255, 255, 0), true, false, &cyanProfile},
+    {"iPhone1", "xxxxxxxx",
+     IPAddress(172, 20, 10, 5), IPAddress(172, 20, 10, 1), IPAddress(255, 255, 255, 240), true, false, &MagentaProfile},
+    {"RemoteKeyer-AP1", "password123",
+     IPAddress(192, 168, 4, 10), IPAddress(192, 168, 4, 10), IPAddress(255, 255, 255, 0), true, true, &yellowProfile}};
+
+const int profileCount = sizeof(serverProfiles) / sizeof(serverProfiles[0]);
+int activeProfileIndex = -1;
+
+#define LOCAL_PORT 8888
+#define SEL_TRX1 0x01
+#define SEL_TRX2 0x02
+#define MAX_EVENTS 1024 // イベントキューの最大サイズ
+#define MAX_ON_DURATION 3000
+#define MAX_FUTURE_WAIT 2000
+
+#define GPIO_SET(pin) GPIO.out_w1ts = (1 << pin)
+#define GPIO_CLR(pin) GPIO.out_w1tc = (1 << pin)
+
+WiFiUDP Udp;
+
+const int keyPinTx1 = 22;
+const int keyPinTx2 = 22;
+// どちらの信号が来ても22で処理
+#define LED_PIN 27
+#define NUMPIXELS 1
+Adafruit_NeoPixel pixels(NUMPIXELS, LED_PIN, NEO_GRB + NEO_KHZ800);
+#define BUTTON_PIN 39
+
+byte pkt[3];
+int packetSize = 0;
+unsigned long lastPacketTime = 0;
+unsigned long lastPingTime = 0;
+unsigned long lastOnTimeTx1 = 0;
+unsigned long lastOnTimeTx2 = 0;
+unsigned long lastBlinkTime = 0;
+bool ledState = false;
+bool lastStateTx1 = false;
+bool lastStateTx2 = false;
+byte lastTrxSel = 0x00;
+byte lastSeqNum = 0xFF;
+bool isReady = false;
+bool serverAlive = true;
+unsigned long dynamicTimeout = 8000;
+unsigned long profileSelectStart = 0;
+const unsigned long PROFILE_SELECT_WINDOW = 10000; // 10秒
+bool profileSelected = false;
+int selectedProfileIndex = 0;
+
+const unsigned long MIN_EVENT_INTERVAL = 10; // ms単位での最小登録間隔
+
+struct CWEvent
+{
+  bool isOn;
+  byte trxSel;
+  uint64_t opTimeMs;
+};
+
+CWEvent eventQueue[MAX_EVENTS];
+uint16_t queueHead = 0;
+uint16_t queueTail = 0;
+
+bool connectServerProfile();
+void setLedColor(uint8_t r, uint8_t g, uint8_t b);
+void saveProfileIndexToEEPROM(int index);
+int loadProfileIndexFromEEPROM();
+
+void setup()
+{
+  Serial.begin(115200);
+  // EEPROM.begin(EEPROM_SIZE);
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+
+  pixels.begin();
+  pixels.setBrightness(50); // 明るさ調整（0〜255）
+  ColorProfile *c = serverProfiles[selectedProfileIndex].color;
+  setLedColor(c->r, c->g, c->b);
+
+  selectedProfileIndex = loadProfileIndexFromEEPROM();
+  profileSelectStart = millis();
+
+  // 10秒間だけ選択可能
+  while (millis() - profileSelectStart < PROFILE_SELECT_WINDOW)
+  {
+    static bool lastButtonState = HIGH;
+    bool buttonState = digitalRead(BUTTON_PIN);
+    if (lastButtonState == HIGH && buttonState == LOW)
+    {
+      selectedProfileIndex = (selectedProfileIndex + 1) % profileCount;
+      // saveProfileIndexToEEPROM(selectedProfileIndex);
+
+      c = serverProfiles[selectedProfileIndex].color;
+      setLedColor(c->r, c->g, c->b);
+      //Serial.printf("🔄 プロファイル切替: %d (%s)\n", selectedProfileIndex, serverProfiles[selectedProfileIndex].ssid);
+    }
+    lastButtonState = buttonState;
+    delay(100);
+  }
+
+  activeProfileIndex = selectedProfileIndex;
+  c = serverProfiles[activeProfileIndex].color;
+  setLedColor(c->r, c->g, c->b);
+  gpio_pad_select_gpio((gpio_num_t)BUTTON_PIN);
+  gpio_set_direction((gpio_num_t)BUTTON_PIN, GPIO_MODE_DISABLE);
+  // EEPROM.end();
+
+  pinMode(keyPinTx1, OUTPUT);
+  //  pinMode(keyPinTx2, OUTPUT);
+  GPIO_CLR(keyPinTx1);
+  //  GPIO_CLR(keyPinTx2);
+
+  connectServerProfile();
+  Udp.begin(LOCAL_PORT);
+  lastPacketTime = millis();
+  lastPingTime = millis();
+
+  int rssi = WiFi.RSSI();
+  dynamicTimeout = constrain(map(rssi, -90, -30, 12000, 4000), 4000, 12000);
+}
+
+void loop()
+{
+  unsigned long now = millis();
+  packetSize = Udp.parsePacket();
+
+  if (packetSize == 10)
+  {
+    byte buf[10];
+    Udp.read(buf, 10);
+    CWEvent ev;
+    ev.isOn = buf[0] & 0x01;
+    ev.trxSel = buf[1];
+    ev.opTimeMs = 0;
+    for (int i = 0; i < 8; i++)
+      ev.opTimeMs = (ev.opTimeMs << 8) | buf[2 + i];
+
+    if (ev.opTimeMs > now + MAX_FUTURE_WAIT)
+      return;
+
+    bool shouldSave = (queueHead == queueTail);
+    if (!shouldSave)
+    {
+      uint16_t lastIndex = (queueTail == 0) ? (MAX_EVENTS - 1) : (queueTail - 1);
+      CWEvent &last = eventQueue[lastIndex];
+      bool stateChanged = (ev.isOn != last.isOn || ev.trxSel != last.trxSel);
+      bool timeSeparated = abs((long)(ev.opTimeMs - last.opTimeMs)) >= MIN_EVENT_INTERVAL;
+      shouldSave = stateChanged || timeSeparated;
+    }
+
+    if (shouldSave)
+    {
+      uint16_t nextTail = (queueTail + 1) % MAX_EVENTS;
+      if (nextTail != queueHead)
+      {
+        uint16_t insertPos = queueTail;
+        for (uint16_t i = queueHead; i != queueTail; i = (i + 1) % MAX_EVENTS)
+        {
+          if (ev.opTimeMs < eventQueue[i].opTimeMs)
+          {
+            insertPos = i;
+            break;
+          }
+        }
+        if (insertPos != queueTail)
+        {
+          for (uint16_t i = queueTail; i != insertPos; i = (i == 0 ? MAX_EVENTS - 1 : i - 1))
+          {
+            uint16_t prev = (i == 0 ? MAX_EVENTS - 1 : i - 1);
+            eventQueue[i] = eventQueue[prev];
+          }
+        }
+        eventQueue[insertPos] = ev;
+        queueTail = nextTail;
+      }
+    }
+
+    lastPacketTime = now;
+    lastPingTime = now;
+    serverAlive = true;
+  }
+
+  else if (packetSize == 13)
+  {
+    byte buf[13];
+    Udp.read(buf, 13);
+    byte trxSel = buf[0];
+    byte keyBits = buf[1];
+    unsigned long baseTime = ((unsigned long)buf[2] << 16) |
+                             ((unsigned long)buf[3] << 8) |
+                             (unsigned long)buf[4];
+
+    for (int i = 0; i < 8; i++)
+    {
+      bool isOn = (keyBits >> (7 - i)) & 0x01;
+      unsigned long opTimeMs = baseTime + buf[5 + i];
+
+      if (millis() > opTimeMs)
+        continue;
+
+      // --- イベントの重複排除ロジック ---
+      uint16_t insertPos = queueTail;
+      for (uint16_t j = queueHead; j != queueTail; j = (j + 1) % MAX_EVENTS)
+      {
+        if (opTimeMs < eventQueue[j].opTimeMs)
+        {
+          insertPos = j;
+          break;
+        }
+      }
+
+      uint16_t prevIndex = (insertPos == 0) ? (MAX_EVENTS - 1) : (insertPos - 1);
+      CWEvent &prev = eventQueue[prevIndex];
+      bool stateChanged = (isOn != prev.isOn || trxSel != prev.trxSel);
+      bool timeSeparated = abs((long)(opTimeMs - prev.opTimeMs)) >= MIN_EVENT_INTERVAL;
+      if (!stateChanged && !timeSeparated)
+        continue; // ← スキップ
+
+      CWEvent ev = {isOn, trxSel, opTimeMs};
+      uint16_t nextTail = (queueTail + 1) % MAX_EVENTS;
+      if (nextTail != queueHead)
+      {
+        uint16_t insertPos = queueTail;
+        for (uint16_t i = queueHead; i != queueTail; i = (i + 1) % MAX_EVENTS)
+        {
+          if (ev.opTimeMs < eventQueue[i].opTimeMs)
+          {
+            insertPos = i;
+            break;
+          }
+        }
+        if (insertPos != queueTail)
+        {
+          for (uint16_t i = queueTail; i != insertPos; i = (i == 0 ? MAX_EVENTS - 1 : i - 1))
+          {
+            uint16_t prev = (i == 0 ? MAX_EVENTS - 1 : i - 1);
+            eventQueue[i] = eventQueue[prev];
+          }
+        }
+        eventQueue[insertPos] = ev;
+        queueTail = nextTail;
+      }
+
+      lastTrxSel = trxSel;
+      if (trxSel == SEL_TRX1)
+        lastStateTx1 = isOn;
+      if (trxSel == SEL_TRX2)
+        lastStateTx2 = isOn;
+    }
+
+    lastPacketTime = millis();
+    lastPingTime = millis();
+    serverAlive = true;
+  }
+
+  else if (packetSize == 3)
+  {
+    Udp.read(pkt, 3);
+    bool isOn = pkt[0] & 0x01;
+    byte trxSel = pkt[1];
+    byte seq = pkt[2];
+    if (seq == lastSeqNum)
+      return;
+    lastSeqNum = seq;
+
+    if (trxSel != lastTrxSel)
+    {
+      if (lastStateTx1)
+        // digitalWrite(keyPinTx1, LOW);
+        GPIO_CLR(keyPinTx1);
+      if (lastStateTx2)
+        // digitalWrite(keyPinTx2, LOW);
+        GPIO_CLR(keyPinTx2);
+      lastStateTx1 = false;
+      lastStateTx2 = false;
+    }
+
+    if (trxSel == SEL_TRX1 && isOn != lastStateTx1)
+    {
+      // digitalWrite(keyPinTx1, isOn ? HIGH : LOW);
+      isOn ? GPIO_SET(keyPinTx1) : GPIO_CLR(keyPinTx1);
+
+      lastStateTx1 = isOn;
+      lastOnTimeTx1 = isOn ? now : lastOnTimeTx1;
+    }
+
+    if (trxSel == SEL_TRX2 && isOn != lastStateTx2)
+    {
+      // digitalWrite(keyPinTx2, isOn ? HIGH : LOW);
+      isOn ? GPIO_SET(keyPinTx2) : GPIO_CLR(keyPinTx2);
+      lastStateTx2 = isOn;
+      lastOnTimeTx2 = isOn ? now : lastOnTimeTx2;
+    }
+
+    lastTrxSel = trxSel;
+    lastPacketTime = now;
+    lastPingTime = now;
+    serverAlive = true;
+
+    byte ack[2] = {0xA0, seq};
+    Udp.beginPacket(Udp.remoteIP(), Udp.remotePort());
+    Udp.write(ack, 2);
+    Udp.endPacket();
+  }
+
+  else if (packetSize == 5)
+  {
+    byte buf[5];
+    Udp.read(buf, 5);
+    delay(10);
+    //Serial.printf("📩 SYNCリクエスト受信: buf[0]=0x%02X\n", buf[0]);
+    if (buf[0] == 0xE0)
+    {
+      unsigned long serverRecvMs = now;
+      byte reply[9] = {0xE1};
+      for (int i = 0; i < 8; i++)
+        reply[1 + i] = (serverRecvMs >> (56 - i * 8)) & 0xFF;
+      Udp.beginPacket(Udp.remoteIP(), Udp.remotePort());
+      Udp.write(reply, 9);
+      Udp.endPacket();
+      isReady = true;
+      serverAlive = true;
+    }
+  }
+
+  else if (packetSize == 1)
+  {
+    byte ping;
+    Udp.read(&ping, 1);
+    if (ping == 0xFF)
+    {
+      byte reply = 0xFE;
+      Udp.beginPacket(Udp.remoteIP(), Udp.remotePort());
+      Udp.write(&reply, 1);
+      Udp.endPacket();
+      lastPingTime = now;
+      serverAlive = true;
+    }
+  }
+
+  else if (packetSize == 4)
+  {
+    byte buf[4];
+    Udp.read(buf, 4);
+    lastPacketTime = now;
+  }
+
+  if (queueHead != queueTail)
+  {
+    CWEvent &ev = eventQueue[queueHead];
+    if (now >= ev.opTimeMs)
+    {
+
+      // === イベント順序チェック ===
+      static uint64_t lastEventTime = 0;
+      if (ev.opTimeMs < lastEventTime)
+      {
+        // Serial.printf("⚠️ Event time reversed! current: %llu, last: %llu\n", ev.opTimeMs, lastEventTime);
+      }
+      lastEventTime = ev.opTimeMs;
+
+      if (ev.trxSel != lastTrxSel)
+      {
+        if (lastStateTx1)
+          // digitalWrite(keyPinTx1, LOW);
+          GPIO_CLR(keyPinTx1);
+        if (lastStateTx2)
+          // digitalWrite(keyPinTx2, LOW);
+          GPIO_CLR(keyPinTx2);
+        lastStateTx1 = false;
+        lastStateTx2 = false;
+      }
+
+      if (ev.trxSel == SEL_TRX1)
+      {
+        if (ev.isOn != lastStateTx1)
+        {
+          // digitalWrite(keyPinTx1, ev.isOn ? HIGH : LOW);
+          ev.isOn ? GPIO_SET(keyPinTx1) : GPIO_CLR(keyPinTx1);
+
+          lastStateTx1 = ev.isOn;
+          lastOnTimeTx1 = ev.isOn ? now : lastOnTimeTx1;
+        }
+      }
+
+      if (ev.trxSel == SEL_TRX2)
+      {
+        if (ev.isOn != lastStateTx2)
+        {
+          // digitalWrite(keyPinTx2, ev.isOn ? HIGH : LOW);
+          ev.isOn ? GPIO_SET(keyPinTx2) : GPIO_CLR(keyPinTx2);
+
+          lastStateTx2 = ev.isOn;
+          lastOnTimeTx2 = ev.isOn ? now : lastOnTimeTx2;
+        }
+      }
+
+      lastTrxSel = ev.trxSel;
+      queueHead = (queueHead + 1) % MAX_EVENTS;
+    }
+  }
+
+  // ==== TRX ON安全対策（ONが長すぎる場合は強制OFF） ====
+  if (lastStateTx1 && now - lastOnTimeTx1 > MAX_ON_DURATION)
+  {
+    // digitalWrite(keyPinTx1, LOW);
+    GPIO_CLR(keyPinTx1);
+    lastStateTx1 = false;
+  }
+  if (lastStateTx2 && now - lastOnTimeTx2 > MAX_ON_DURATION)
+  {
+    // digitalWrite(keyPinTx2, LOW);
+    GPIO_CLR(keyPinTx2);
+    lastStateTx2 = false;
+  }
+
+  // ==== 通信タイムアウト処理 ====
+  if (now - lastPacketTime >= dynamicTimeout)
+  {
+    if (lastStateTx1)
+      // digitalWrite(keyPinTx1, LOW);
+      GPIO_CLR(keyPinTx1);
+    if (lastStateTx2)
+      // digitalWrite(keyPinTx2, LOW);
+      GPIO_CLR(keyPinTx2);
+    lastStateTx1 = false;
+    lastStateTx2 = false;
+    isReady = false;
+    serverAlive = false;
+  }
+
+  // ==== SYNC完了LED点滅処理 ====
+  if (isReady && serverAlive)
+  {
+    if (now - lastBlinkTime >= 500)
+    {
+      ledState = !ledState;
+      if (ledState)
+      {
+        pixels.setPixelColor(0, pixels.Color(0, 0, 255)); // 青
+      }
+      else
+      {
+        pixels.setPixelColor(0, pixels.Color(0, 0, 0)); // 消灯
+      }
+      pixels.show();
+      lastBlinkTime = now;
+    }
+  }
+  else if (!serverAlive)
+  {
+    pixels.setPixelColor(0, pixels.Color(255, 0, 0)); // 未接続 → 赤
+    pixels.show();
+  }
+  else
+  {
+    pixels.setPixelColor(0, pixels.Color(0, 255, 0)); // 通信中 → 緑などに変更可能
+    pixels.show();
+  }
+
+  // ==== 処理間隔調整 ====
+  if (queueHead == queueTail)
+    delay(1);
+
+  int queueUsage = (queueTail - queueHead + MAX_EVENTS) % MAX_EVENTS;
+  if (queueUsage > MAX_EVENTS * 0.8)
+  {
+    // Serial.printf("⚠️ Queue usage high: %d/%d\n", queueUsage, MAX_EVENTS);
+  }
+}
+
+// ==== WiFi接続関数（複数プロファイル対応） ====
+bool connectServerProfile()
+{
+  ServerProfile &profile = serverProfiles[activeProfileIndex]; // ← 選択済みのプロファイルだけ！
+
+  if (profile.isApMode)
+  {
+    WiFi.disconnect(true);
+    WiFi.mode(WIFI_AP);
+    WiFi.softAPConfig(profile.localIP, profile.gateway, profile.subnet);
+    WiFi.softAP(profile.ssid, profile.password);
+    // Serial.printf("📡 APモード開始: SSID=%s, IP=%s\n", profile.ssid, profile.localIP.toString().c_str());
+
+    // クライアント接続待ち（最大30秒）
+    unsigned long startWait = millis();
+    while (millis() - startWait < 30000)
+    {
+      int clients = WiFi.softAPgetStationNum();
+      if (clients > 0)
+      {
+        // Serial.printf("✅ クライアント接続確認: %d台\n", clients);
+        setLedColor(profile.color->r, profile.color->g, profile.color->b);
+        return true;
+      }
+      delay(500);
+    }
+
+    // Serial.println("⚠️ クライアント接続なし（タイムアウト）");
+  }
+  else
+  {
+    WiFi.mode(WIFI_STA);
+    if (profile.hasIP)
+    {
+      WiFi.config(profile.localIP, profile.gateway, profile.subnet);
+    }
+    WiFi.begin(profile.ssid, profile.password);
+    for (int t = 0; t < 60; t++) // 最大30秒待つ
+    {
+      if (WiFi.status() == WL_CONNECTED)
+      {
+        setLedColor(profile.color->r, profile.color->g, profile.color->b);
+        // Serial.printf("✅ 接続成功: SSID=%s, IP=%s\n", profile.ssid, WiFi.localIP().toString().c_str());
+        return true;
+      }
+      delay(500);
+    }
+
+    //  Serial.printf("❌ 接続失敗: SSID=%s\n", profile.ssid);
+  }
+
+  return false;
+}
+
+void setLedColor(uint8_t r, uint8_t g, uint8_t b)
+{
+  pixels.setPixelColor(0, pixels.Color(r, g, b));
+  pixels.show();
+}
+
+void saveProfileIndexToEEPROM(int index)
+{
+  EEPROM.write(EEPROM_ADDR_PROFILE_INDEX, index);
+  EEPROM.commit();
+}
+
+int loadProfileIndexFromEEPROM()
+{
+  byte val = EEPROM.read(EEPROM_ADDR_PROFILE_INDEX);
+  if (val < profileCount)
+    return val;
+  return 0; // デフォルト
+}

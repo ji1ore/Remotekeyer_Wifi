@@ -1,0 +1,442 @@
+/*=============================================================================*
+ * RemoteKeyer クライアント用ファームウェア FIX0.9
+ * Arduino UNO R4 WiFi（RA4M1）対応
+ * Copyright (C) 2025 JI1ORE
+ *=============================================================================*/
+#include <Arduino.h>
+#include <WiFiS3.h>
+#include <WiFiUdp.h>
+
+// ==== ピン定義 ====
+#define KEY_PIN 8
+#define TRX_PIN 7
+#define LED_PIN 9
+
+// ==== UDP設定 ====
+#define LOCAL_PORT 8888
+#define SERVER_PORT 8888
+WiFiUDP Udp;
+
+// ==== WiFi設定 ====
+struct WiFiProfile
+{
+  const char *ssid;
+  const char *password;
+  IPAddress localIP;
+  IPAddress gateway;
+  IPAddress subnet;
+  IPAddress serverIP;
+};
+
+WiFiProfile wifiProfiles[] = {
+    {"iPhone1", "xxxxxxxx", IPAddress(172, 20, 10, 6), IPAddress(172, 20, 10, 1), IPAddress(255, 255, 255, 240), IPAddress(172, 20, 10, 5)},
+    {"LAN-1", "xxxxxxxx", IPAddress(192, 168, 0, 51), IPAddress(192, 168, 0, 1), IPAddress(255, 255, 255, 0), IPAddress(192, 168, 0, 50)}};
+
+const int profileCount = sizeof(wifiProfiles) / sizeof(wifiProfiles[0]);
+IPAddress serverIP;
+
+// ==== 動作パラメータ ====
+unsigned long MAX_ON_DURATION = 3000;
+int keyRepeatCount = 1;
+long KEY_SEND_INTERVAL_US = 10000; // 疎送信間隔（10ms）
+const int PING_INTERVAL = 1000;
+const int ReCal_RTT = 5000;
+
+// ==== 遅延分類 ====
+// ping返送時間(msec)
+const int RTT_THRESH_1 = 5;
+const int RTT_THRESH_2 = 10;
+const int RTT_THRESH_3 = 25;
+const int RTT_THRESH_4 = 50;
+const int RTT_THRESH_5 = 75;
+const int RTT_THRESH_6 = 100;
+const int RTT_THRESH_7 = 200;
+
+// ping返送時間間隔ごとの遅延時間定義(msec)
+const int DELAY_VERY_LOW = 40;    // RTT_THRESH_1以下
+const int DELAY_LOW = 50;         // RTT_THRESH_2以下
+const int DELAY_MID = 75;         // RTT_THRESH_3以下
+const int DELAY_HIGH = 100;       // RTT_THRESH_4以下
+const int DELAY_VERY_HIGH = 125;  // RTT_THRESH_5以下
+const int DELAY_VERY2_HIGH = 150; // RTT_THRESH_6以下
+const int DELAY_VERY3_HIGH = 250; // RTT_THRESH_7以下
+const int DELAY_MAX = 500;        // RTT_THRESH_7超
+
+const unsigned long BLINK_INTERVAL_WIFI = 1000;
+const unsigned long BLINK_INTERVAL_SYNC = 300;
+unsigned long blinkInterval = BLINK_INTERVAL_WIFI;
+unsigned long lastSyncRequestMillis = 0;
+unsigned long lastSyncRetryMillis = 0;
+
+// ==== 状態管理 ====
+volatile bool immediateSendRequested = false;
+volatile bool keyState = false;
+volatile unsigned long lastIsrMicros = 0;
+
+unsigned long lastSendMicros = 0;
+unsigned long lastOnMillis = 0;
+unsigned long lastBlinkMillis = 0;
+unsigned long lastPingMillis = 0;
+unsigned long lastPingSendMillis = 0;
+long delayOffsetMs = 0;
+bool timeSynced = false;
+bool ledState = false;
+unsigned long dynamicTimeout = 8000;
+static unsigned long lastDelayRecalcMillis = 0;
+
+int fixedDelayMs = 50;
+bool fixedDelayLocked = false;
+bool wifiWasDisconnected = false;
+bool currentKeyState = false;
+
+const unsigned long DEFAULT_TIMEOUT_MIN = 4000;
+const unsigned long DEFAULT_TIMEOUT_MAX = 12000;
+bool syncRequested = false;
+
+// ==== 関数プロトタイプ ====
+bool connectToWiFi();
+void requestMillisSync();
+void sendKeyPacket(bool isOn, byte trxSel, uint64_t opTimeMs);
+
+// ==== RTT履歴 ====
+const int RTT_HISTORY_SIZE = 5;
+long rttHistory[RTT_HISTORY_SIZE] = {0};
+int rttIndex = 0;
+long pingRttMs = 0;
+
+long getAverageRtt()
+{
+  long sum = 0;
+  for (int i = 0; i < RTT_HISTORY_SIZE; i++)
+    sum += rttHistory[i];
+  return sum / RTT_HISTORY_SIZE;
+}
+
+// ==== 割り込み処理 ====
+const unsigned long DEBOUNCE_US = 5000;
+
+void keyISR()
+{
+  unsigned long now = micros();
+  if (now - lastIsrMicros < DEBOUNCE_US)
+    return;
+  lastIsrMicros = now;
+  // keyState = (digitalRead(KEY_PIN) == LOW);
+  keyState = !(R_PORT3->PIDR_b.PIDR4); // LOWならtrue（押下）
+  immediateSendRequested = true;
+}
+
+// ==== 初期化 ====
+void setup()
+{
+  Serial.begin(115200);
+  connectToWiFi();
+  Udp.begin(LOCAL_PORT);
+  requestMillisSync();
+  lastPingMillis = millis();
+
+  //  pinMode(KEY_PIN, INPUT_PULLUP);
+  //  pinMode(TRX_PIN, INPUT_PULLUP);
+  //  pinMode(LED_PIN, OUTPUT);
+  //  digitalWrite(LED_PIN, LOW);
+
+  // KEY_PIN（D8 → P304）
+  R_PFS->PORT[3].PIN[4].PmnPFS_b.PMR = 0; // 周辺機能無効
+  R_PFS->PORT[3].PIN[4].PmnPFS_b.PDR = 0; // 入力モード
+  R_PFS->PORT[3].PIN[4].PmnPFS_b.PCR = 1; // プルアップ有効
+
+  // TRX_PIN（D7 → P112）
+  R_PFS->PORT[1].PIN[2].PmnPFS_b.PMR = 0; // 周辺機能無効
+  R_PFS->PORT[1].PIN[2].PmnPFS_b.PDR = 0; // 入力モード
+  R_PFS->PORT[1].PIN[2].PmnPFS_b.PCR = 1; // プルアップ有効
+
+  // LED_PIN（D9 → P303）
+  R_PFS->PORT[3].PIN[3].PmnPFS_b.PMR = 0;
+  R_PFS->PORT[3].PIN[3].PmnPFS_b.PDR = 1;
+  R_PORT3->PODR_b.PODR3 = 0; // 初期状態OFF
+
+  attachInterrupt(digitalPinToInterrupt(KEY_PIN), keyISR, CHANGE);
+}
+
+// ==== メインループ ====
+void loop()
+{
+  unsigned long nowMicros = micros();
+  unsigned long nowMillis = millis();
+  // byte trxCode = (digitalRead(TRX_PIN) == LOW) ? 0x02 : 0x01;
+  byte trxCode = (!(R_PORT1->PIDR_b.PIDR2)) ? 0x02 : 0x01;
+
+  // 即時送信処理
+  bool doSend = false;
+  bool sendState = false;
+  noInterrupts();
+  if (immediateSendRequested)
+  {
+    doSend = true;
+    sendState = keyState;
+    immediateSendRequested = false;
+  }
+  interrupts();
+
+  if (doSend && timeSynced)
+  {
+    currentKeyState = sendState;
+
+    // 割り込み時刻（μs）→ ms に変換して送信時刻を補正
+    unsigned long sendMillis = lastIsrMicros / 1000;
+    uint64_t opTimeMs = sendMillis + delayOffsetMs + fixedDelayMs;
+
+    int repeat = currentKeyState ? 1 : 3;
+    for (int i = 0; i < repeat; i++)
+    {
+      sendKeyPacket(currentKeyState, trxCode, opTimeMs);
+    }
+
+    lastSendMicros = nowMicros;
+    lastOnMillis = currentKeyState ? nowMillis : lastOnMillis;
+  }
+
+  // 疎送信（ON/OFF問わず）
+  if (timeSynced && nowMicros - lastSendMicros >= KEY_SEND_INTERVAL_US)
+  {
+    uint64_t opTimeMs = nowMillis + delayOffsetMs + fixedDelayMs;
+    sendKeyPacket(currentKeyState, trxCode, opTimeMs);
+    lastSendMicros = nowMicros;
+    if (currentKeyState)
+      lastOnMillis = nowMillis;
+  }
+
+  // UDP受信処理
+  int size = Udp.parsePacket();
+  if (size > 0)
+  {
+    byte buf[12];
+    int len = Udp.read(buf, size);
+
+    if (size == 9 && buf[0] == 0xE1)
+    {
+      uint64_t serverRecvMs = 0;
+      for (int i = 0; i < 8; i++)
+        serverRecvMs = (serverRecvMs << 8) | buf[1 + i];
+
+      long offset = (long)serverRecvMs - (long)nowMillis;
+
+      // ⑤ サーバーの起動時間巻き戻り検出
+      if (offset < -5000)
+      {
+        Serial.println("サーバーの起動時間が大幅に巻き戻りました。クライアントを再起動します。");
+        NVIC_SystemReset(); // UNO R4 WiFi用
+        return;
+      }
+
+      delayOffsetMs = offset;
+
+      // ③ SYNC成功時の初期化
+      timeSynced = true;
+      lastPingMillis = nowMillis;
+      lastPingSendMillis = nowMillis;
+      blinkInterval = BLINK_INTERVAL_SYNC;
+
+      // ④ 遅延再評価の準備
+      fixedDelayLocked = false;
+      rttIndex = 0;
+      for (int i = 0; i < RTT_HISTORY_SIZE; i++)
+        rttHistory[i] = 0;
+
+      // ③ SYNC再送制御の初期化
+      lastSyncRequestMillis = nowMillis;
+      lastSyncRetryMillis = nowMillis;
+
+      // LED状態を現在のキー状態に合わせる
+      R_PORT3->PODR_b.PODR3 = currentKeyState ? 1 : 0;
+    }
+
+    else if (size == 1 && buf[0] == 0xFE)
+    {
+      long rtt = nowMillis - lastPingSendMillis;
+      rttHistory[rttIndex] = rtt;
+      rttIndex = (rttIndex + 1) % RTT_HISTORY_SIZE;
+      pingRttMs = getAverageRtt();
+
+      if (!fixedDelayLocked)
+      {
+        if (pingRttMs <= RTT_THRESH_1)
+          fixedDelayMs = DELAY_VERY_LOW;
+        else if (pingRttMs <= RTT_THRESH_2)
+          fixedDelayMs = DELAY_LOW;
+        else if (pingRttMs <= RTT_THRESH_3)
+          fixedDelayMs = DELAY_MID;
+        else if (pingRttMs <= RTT_THRESH_4)
+          fixedDelayMs = DELAY_HIGH;
+        else if (pingRttMs <= RTT_THRESH_5)
+          fixedDelayMs = DELAY_VERY_HIGH;
+        else if (pingRttMs <= RTT_THRESH_6)
+          fixedDelayMs = DELAY_VERY2_HIGH;
+        else if (pingRttMs <= RTT_THRESH_7)
+          fixedDelayMs = DELAY_VERY3_HIGH;
+        else
+          fixedDelayMs = DELAY_MAX;
+
+        fixedDelayLocked = true;
+      }
+
+      lastPingMillis = nowMillis;
+    }
+  }
+
+  // PING送信
+  if (timeSynced && nowMillis - lastPingMillis > PING_INTERVAL)
+  {
+    byte ping = 0xFF;
+    Udp.beginPacket(serverIP, SERVER_PORT);
+    Udp.write(&ping, 1);
+    Udp.endPacket();
+    lastPingSendMillis = nowMillis;
+  }
+
+  // 遅延時間再計算
+  if (timeSynced && nowMillis - lastDelayRecalcMillis >= ReCal_RTT)
+  {
+    lastDelayRecalcMillis = nowMillis;
+    pingRttMs = getAverageRtt();
+
+    if (!fixedDelayLocked)
+    {
+      if (pingRttMs <= RTT_THRESH_1)
+        fixedDelayMs = DELAY_VERY_LOW;
+      else if (pingRttMs <= RTT_THRESH_2)
+        fixedDelayMs = DELAY_LOW;
+      else if (pingRttMs <= RTT_THRESH_3)
+        fixedDelayMs = DELAY_MID;
+      else if (pingRttMs <= RTT_THRESH_4)
+        fixedDelayMs = DELAY_HIGH;
+      else if (pingRttMs <= RTT_THRESH_5)
+        fixedDelayMs = DELAY_VERY_HIGH;
+      else if (pingRttMs <= RTT_THRESH_6)
+        fixedDelayMs = DELAY_VERY2_HIGH;
+      else if (pingRttMs <= RTT_THRESH_7)
+        fixedDelayMs = DELAY_VERY3_HIGH;
+      else
+        fixedDelayMs = DELAY_MAX;
+    }
+  }
+
+  // ==== サーバ応答タイムアウト検出 ====
+  if (timeSynced && nowMillis - lastPingMillis >= dynamicTimeout)
+  {
+    timeSynced = false;
+    blinkInterval = BLINK_INTERVAL_WIFI;
+    fixedDelayLocked = false;
+    Serial.println("サーバとの接続タイムアウト。待機状態に戻ります。");
+  }
+
+  // LED点滅
+  if (nowMillis - lastBlinkMillis >= blinkInterval)
+  {
+    ledState = !ledState;
+    // digitalWrite(LED_PIN, ledState ? HIGH : LOW);
+    R_PORT3->PODR_b.PODR3 = ledState ? 1 : 0;
+    lastBlinkMillis = nowMillis;
+  }
+
+  // WiFi切断検出
+  if (WiFi.status() != WL_CONNECTED)
+  {
+    wifiWasDisconnected = true;
+    timeSynced = false;
+    blinkInterval = BLINK_INTERVAL_WIFI;
+    fixedDelayLocked = false;
+  }
+
+  // ==== SYNC再送の自動化 ====
+  static unsigned long lastSyncRetryMillis = 0;
+  if (!timeSynced && WiFi.status() == WL_CONNECTED)
+  {
+    if (!syncRequested || millis() - lastSyncRetryMillis >= 5000)
+    {
+      requestMillisSync();
+      syncRequested = true;
+      lastSyncRetryMillis = millis();
+      Serial.println("SYNC再送要求を送信しました");
+    }
+  }
+
+  // ==== 時間再評価 ====
+  if (timeSynced && !currentKeyState && (millis() - lastOnMillis >= 5000))
+  {
+    fixedDelayLocked = false;
+  }
+
+  if (!timeSynced)
+    return;
+
+  // ON安全対策
+  if (currentKeyState && nowMillis - lastOnMillis > MAX_ON_DURATION)
+  {
+    currentKeyState = false;
+    uint64_t opTimeMs = nowMillis + delayOffsetMs + fixedDelayMs;
+    sendKeyPacket(false, trxCode, opTimeMs);
+  }
+}
+
+// ==== WiFi接続 ====
+bool connectToWiFi()
+{
+  for (int i = 0; i < profileCount; i++)
+  {
+    WiFiProfile profile = wifiProfiles[i]; // ← & を外して構文を簡潔に
+    WiFi.config(profile.localIP, profile.gateway, profile.subnet);
+    WiFi.begin(profile.ssid, profile.password);
+    for (int t = 0; t < 10; t++)
+    {
+      if (WiFi.status() == WL_CONNECTED)
+      {
+        serverIP = profile.serverIP;
+        int rssi = WiFi.RSSI();
+        dynamicTimeout = constrain(map(rssi, -90, -30, DEFAULT_TIMEOUT_MAX, DEFAULT_TIMEOUT_MIN),
+                                   DEFAULT_TIMEOUT_MIN, DEFAULT_TIMEOUT_MAX);
+        return true;
+      }
+      delay(500);
+    }
+  }
+  return false;
+}
+
+// ==== SYNC要求（時刻補正専用） ====
+void requestMillisSync()
+{
+  lastSyncRequestMillis = millis();
+  lastPingSendMillis = lastSyncRequestMillis;
+  byte pkt[5] = {
+      0xE0,
+      (lastSyncRequestMillis >> 24) & 0xFF,
+      (lastSyncRequestMillis >> 16) & 0xFF,
+      (lastSyncRequestMillis >> 8) & 0xFF,
+      lastSyncRequestMillis & 0xFF};
+  Udp.beginPacket(serverIP, SERVER_PORT);
+  Udp.write(pkt, 5);
+  Udp.endPacket();
+}
+
+// ==== キーパケット送信 ====
+void sendKeyPacket(bool isOn, byte trxSel, uint64_t opTimeMs)
+{
+  byte pkt[10];
+  pkt[0] = isOn ? 0x01 : 0x00;
+  pkt[1] = trxSel;
+  for (int i = 0; i < 8; i++)
+    pkt[2 + i] = (opTimeMs >> (56 - i * 8)) & 0xFF;
+
+  for (int i = 0; i < keyRepeatCount; i++)
+  {
+    if (!Udp.beginPacket(serverIP, SERVER_PORT))
+      return;
+    Udp.write(pkt, 10);
+    Udp.endPacket();
+    yield();
+  }
+
+  // digitalWrite(LED_PIN, isOn ? HIGH : LOW);
+  R_PORT3->PODR_b.PODR3 = isOn ? 1 : 0;
+}
