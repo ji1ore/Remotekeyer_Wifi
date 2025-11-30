@@ -1,5 +1,5 @@
 /*=============================================================================*
- * RemoteKeyer クライアント用ファームウェア Ver1.0
+ * RemoteKeyer クライアント用ファームウェア Ver1.01
  * ESPr® One 32 対応
  * レジスタ制御をやめる(符号安定化のため)
  * Copyright (C) 2025 JI1ORE
@@ -26,11 +26,14 @@ struct WiFiProfile
   IPAddress gateway;
   IPAddress subnet;
   IPAddress serverIP;
+  bool isAP; // ← trueならAPモード
 };
 
 WiFiProfile wifiProfiles[] = {
-    {"iPhone1", "xxxxxxxx", IPAddress(172, 20, 10, 6), IPAddress(172, 20, 10, 1), IPAddress(255, 255, 255, 240), IPAddress(172, 20, 10, 5)},
-    {"LAN-1", "xxxxxxxx", IPAddress(192, 168, 0, 51), IPAddress(192, 168, 0, 1), IPAddress(255, 255, 255, 0), IPAddress(192, 168, 0, 50)}};
+    {"iPhone1", "xxxxxxxx", IPAddress(172, 20, 10, 6), IPAddress(172, 20, 10, 1), IPAddress(255, 255, 255, 240), IPAddress(172, 20, 10, 5),false},
+    {"LAN-1", "xxxxxxxx", IPAddress(192, 168, 0, 51), IPAddress(192, 168, 0, 1), IPAddress(255, 255, 255, 0), IPAddress(192, 168, 0, 50),false},
+    {"RemoteKeyer-AP", "password123", IPAddress(192, 168, 4, 2), IPAddress(192, 168, 4, 1), IPAddress(255, 255, 255, 0), IPAddress(192, 168, 4, 1), true}};
+
 
 const int profileCount = sizeof(wifiProfiles) / sizeof(wifiProfiles[0]);
 IPAddress serverIP;
@@ -355,7 +358,7 @@ void loop()
       if (!currentKeyState)
       { // キー送信中は表示しない
         lostPingCount++;
-        //Serial.printf("⚠️ Ping lost! Count: %d (last RTT=%ld ms)\n", lostPingCount, pingRttMs);
+        // Serial.printf("⚠️ Ping lost! Count: %d (last RTT=%ld ms)\n", lostPingCount, pingRttMs);
       }
       else
       {
@@ -414,12 +417,43 @@ void loop()
     fixedDelayLocked = false;
   }
 
-  // LED点滅
-  if (nowMillis - lastBlinkMillis >= blinkInterval)
+  // ==== LED点滅処理（APモードとSTAモードで分岐） ====
+  if (wifiProfiles[0].isAP)
   {
-    ledState = !ledState;
-    digitalWrite(LED_PIN, ledState ? HIGH : LOW);
-    lastBlinkMillis = nowMillis;
+    if (!timeSynced)
+    {
+      // APモード + 未同期 → 早・早・遅パターン
+      if (nowMillis - lastApBlinkMillis >= apBlinkPattern[apBlinkIndex])
+      {
+        ledState = !ledState;
+        digitalWrite(LED_PIN, ledState ? HIGH : LOW);
+        lastApBlinkMillis = nowMillis;
+        if (!ledState)
+        {
+          apBlinkIndex = (apBlinkIndex + 1) % apBlinkSteps;
+        }
+      }
+    }
+    else
+    {
+      // APモード + 同期済み → ゆっくり点滅（500ms）
+      if (nowMillis - lastApSyncBlinkMillis >= AP_SYNC_BLINK_INTERVAL)
+      {
+        apSyncLedState = !apSyncLedState;
+        digitalWrite(LED_PIN, apSyncLedState ? HIGH : LOW);
+        lastApSyncBlinkMillis = nowMillis;
+      }
+    }
+  }
+  else
+  {
+    // STAモード（従来通り）
+    if (nowMillis - lastBlinkMillis >= blinkInterval)
+    {
+      ledState = !ledState;
+      digitalWrite(LED_PIN, ledState ? HIGH : LOW);
+      lastBlinkMillis = nowMillis;
+    }
   }
 
   // WiFi切断検出
