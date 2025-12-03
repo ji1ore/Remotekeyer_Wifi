@@ -99,7 +99,7 @@ static int sampleIndex = 0;
 static unsigned long sampleStartTimeMs = 0;
 static unsigned long lastSampleTimeMs = 0;
 const int SAMPLE_SEND_DUP_CNT = 2; // サンプリングパケットの重複送付回数
-const int SAMPLE_INTERVAL_MS = 4;  // サンプリングの周期(msec)
+const int SAMPLE_INTERVAL_MS = 3;  // サンプリングの周期(msec)
 const int SAMPLE_SEND_AMNT = 8;    // サンプリングパケットの送付サイズ(変更時は送付パケットの修正が必要)
 const int PACKET_SEND_INTERVAL_MS = SAMPLE_INTERVAL_MS * SAMPLE_SEND_AMNT;
 
