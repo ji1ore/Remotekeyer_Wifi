@@ -1,9 +1,10 @@
 /*=============================================================================*
- * M5Stadk_RemoteKeyerWifi  サーバー用ファームウェア Ver1.01
+ * M5Stadk_RemoteKeyerWifi  サーバー用ファームウェア Ver1.011
  * M5Stack ATOM Lite 対応
  * Wifiプロファイル選択対応
  * ダイレクト通信対応
- * Copyright (C) 2019-2025 JF5SIM / 修正: JI1ORE
+ * 2025/12/08 処理安定化のための修正
+ * Copyright (C) 2025- JI1ORE
  *=============================================================================*/
 
 #include <WiFi.h>
@@ -54,6 +55,7 @@ int activeProfileIndex = -1;
 #define SEL_TRX1 0x01
 #define SEL_TRX2 0x02
 #define MAX_EVENTS 1024 // イベントキューの最大サイズ
+#define SAME_MAX 10 // ON OFFの連続同一信号の場合の動作省略しきい値 指定回数目から削除
 #define MAX_ON_DURATION 3000
 #define MAX_FUTURE_WAIT 2000
 
@@ -90,7 +92,7 @@ const unsigned long PROFILE_SELECT_WINDOW = 10000; // 10秒
 bool profileSelected = false;
 int selectedProfileIndex = 0;
 
-const unsigned long MIN_EVENT_INTERVAL = 10; // ms単位での最小登録間隔
+const unsigned long MIN_EVENT_INTERVAL = 40; // ms単位での最小登録間隔
 
 struct CWEvent
 {
@@ -134,7 +136,7 @@ void setup()
 
       c = serverProfiles[selectedProfileIndex].color;
       setLedColor(c->r, c->g, c->b);
-      //Serial.printf("🔄 プロファイル切替: %d (%s)\n", selectedProfileIndex, serverProfiles[selectedProfileIndex].ssid);
+      // Serial.printf("🔄 プロファイル切替: %d (%s)\n", selectedProfileIndex, serverProfiles[selectedProfileIndex].ssid);
     }
     lastButtonState = buttonState;
     delay(100);
@@ -164,6 +166,39 @@ void setup()
 void loop()
 {
   unsigned long now = millis();
+
+  while (queueHead != queueTail && now >= eventQueue[queueHead].opTimeMs)
+  {
+    CWEvent &ev = eventQueue[queueHead];
+
+    if (ev.trxSel != lastTrxSel)
+    {
+      if (lastStateTx1)
+        GPIO_CLR(keyPinTx1);
+      if (lastStateTx2)
+        GPIO_CLR(keyPinTx2);
+      lastStateTx1 = false;
+      lastStateTx2 = false;
+    }
+
+    if (ev.trxSel == SEL_TRX1 && ev.isOn != lastStateTx1)
+    {
+      ev.isOn ? GPIO_SET(keyPinTx1) : GPIO_CLR(keyPinTx1);
+      lastStateTx1 = ev.isOn;
+      lastOnTimeTx1 = ev.isOn ? now : lastOnTimeTx1;
+    }
+
+    if (ev.trxSel == SEL_TRX2 && ev.isOn != lastStateTx2)
+    {
+      ev.isOn ? GPIO_SET(keyPinTx2) : GPIO_CLR(keyPinTx2);
+      lastStateTx2 = ev.isOn;
+      lastOnTimeTx2 = ev.isOn ? now : lastOnTimeTx2;
+    }
+
+    lastTrxSel = ev.trxSel;
+    queueHead = (queueHead + 1) % MAX_EVENTS;
+  }
+
   packetSize = Udp.parsePacket();
 
   if (packetSize == 10)
@@ -178,16 +213,30 @@ void loop()
       ev.opTimeMs = (ev.opTimeMs << 8) | buf[2 + i];
 
     if (ev.opTimeMs > now + MAX_FUTURE_WAIT)
-      return;
-
-    bool shouldSave = (queueHead == queueTail);
-    if (!shouldSave)
     {
-      uint16_t lastIndex = (queueTail == 0) ? (MAX_EVENTS - 1) : (queueTail - 1);
-      CWEvent &last = eventQueue[lastIndex];
-      bool stateChanged = (ev.isOn != last.isOn || ev.trxSel != last.trxSel);
-      bool timeSeparated = abs((long)(ev.opTimeMs - last.opTimeMs)) >= MIN_EVENT_INTERVAL;
-      shouldSave = stateChanged || timeSeparated;
+    }
+
+    bool shouldSave = true;
+    int sameCount = 0;
+    for (int i = 1; i <= SAME_MAX; ++i)
+    { // 最大5つ前までチェック（必要に応じて調整）
+      if ((queueTail + MAX_EVENTS - i) % MAX_EVENTS == queueHead)
+        break;
+      CWEvent &prev = eventQueue[(queueTail + MAX_EVENTS - i) % MAX_EVENTS];
+      if (ev.isOn == prev.isOn &&
+          ev.trxSel == prev.trxSel &&
+          abs((long)(ev.opTimeMs - prev.opTimeMs)) < MIN_EVENT_INTERVAL * (i + 1))
+      {
+        sameCount++;
+      }
+      else
+      {
+        break;
+      }
+    }
+    if (sameCount >= SAME_MAX - 1)
+    { // 直前に5つ以上同じ → 今回で6つ目以降 → スキップ
+      shouldSave = false;
     }
 
     if (shouldSave)
@@ -237,7 +286,7 @@ void loop()
       bool isOn = (keyBits >> (7 - i)) & 0x01;
       unsigned long opTimeMs = baseTime + buf[5 + i];
 
-      if (millis() > opTimeMs)
+      if (millis() > opTimeMs + 20)
         continue;
 
       // --- イベントの重複排除ロジック ---
@@ -255,8 +304,26 @@ void loop()
       CWEvent &prev = eventQueue[prevIndex];
       bool stateChanged = (isOn != prev.isOn || trxSel != prev.trxSel);
       bool timeSeparated = abs((long)(opTimeMs - prev.opTimeMs)) >= MIN_EVENT_INTERVAL;
-      if (!stateChanged && !timeSeparated)
-        continue; // ← スキップ
+      // --- 重複排除（特定数以上信号が連続ならスキップ） ---
+      int sameCount = 0;
+      for (int j = 1; j <= SAME_MAX; ++j)
+      {
+        if ((queueTail + MAX_EVENTS - j) % MAX_EVENTS == queueHead)
+          break;
+        CWEvent &prev = eventQueue[(queueTail + MAX_EVENTS - j) % MAX_EVENTS];
+        if (isOn == prev.isOn &&
+            trxSel == prev.trxSel &&
+            abs((long)(opTimeMs - prev.opTimeMs)) < MIN_EVENT_INTERVAL * (j + 1))
+        {
+          sameCount++;
+        }
+        else
+        {
+          break;
+        }
+      }
+      if (sameCount >= SAME_MAX - 1)
+        continue; // 特定数以上信号が連続した場合 → スキップ
 
       CWEvent ev = {isOn, trxSel, opTimeMs};
       uint16_t nextTail = (queueTail + 1) % MAX_EVENTS;
@@ -350,7 +417,7 @@ void loop()
     byte buf[5];
     Udp.read(buf, 5);
     delay(10);
-    //Serial.printf("📩 SYNCリクエスト受信: buf[0]=0x%02X\n", buf[0]);
+    // Serial.printf("📩 SYNCリクエスト受信: buf[0]=0x%02X\n", buf[0]);
     if (buf[0] == 0xE0)
     {
       unsigned long serverRecvMs = now;
@@ -386,61 +453,62 @@ void loop()
     Udp.read(buf, 4);
     lastPacketTime = now;
   }
-
-  if (queueHead != queueTail)
-  {
-    CWEvent &ev = eventQueue[queueHead];
-    if (now >= ev.opTimeMs)
+  /*
     {
-
-      // === イベント順序チェック ===
-      static uint64_t lastEventTime = 0;
-      if (ev.opTimeMs < lastEventTime)
+      CWEvent &ev = eventQueue[queueHead];
+      if (now >= ev.opTimeMs)
       {
-        // Serial.printf("⚠️ Event time reversed! current: %llu, last: %llu\n", ev.opTimeMs, lastEventTime);
-      }
-      lastEventTime = ev.opTimeMs;
 
-      if (ev.trxSel != lastTrxSel)
-      {
-        if (lastStateTx1)
-          // digitalWrite(keyPinTx1, LOW);
-          GPIO_CLR(keyPinTx1);
-        if (lastStateTx2)
-          // digitalWrite(keyPinTx2, LOW);
-          GPIO_CLR(keyPinTx2);
-        lastStateTx1 = false;
-        lastStateTx2 = false;
-      }
-
-      if (ev.trxSel == SEL_TRX1)
-      {
-        if (ev.isOn != lastStateTx1)
+        // === イベント順序チェック ===
+        static uint64_t lastEventTime = 0;
+        if (ev.opTimeMs < lastEventTime)
         {
-          // digitalWrite(keyPinTx1, ev.isOn ? HIGH : LOW);
-          ev.isOn ? GPIO_SET(keyPinTx1) : GPIO_CLR(keyPinTx1);
-
-          lastStateTx1 = ev.isOn;
-          lastOnTimeTx1 = ev.isOn ? now : lastOnTimeTx1;
+          // Serial.printf("⚠️ Event time reversed! current: %llu, last: %llu\n", ev.opTimeMs, lastEventTime);
         }
-      }
+        lastEventTime = ev.opTimeMs;
 
-      if (ev.trxSel == SEL_TRX2)
-      {
-        if (ev.isOn != lastStateTx2)
+        if (ev.trxSel != lastTrxSel)
         {
-          // digitalWrite(keyPinTx2, ev.isOn ? HIGH : LOW);
-          ev.isOn ? GPIO_SET(keyPinTx2) : GPIO_CLR(keyPinTx2);
-
-          lastStateTx2 = ev.isOn;
-          lastOnTimeTx2 = ev.isOn ? now : lastOnTimeTx2;
+          if (lastStateTx1)
+            // digitalWrite(keyPinTx1, LOW);
+            GPIO_CLR(keyPinTx1);
+          if (lastStateTx2)
+            // digitalWrite(keyPinTx2, LOW);
+            GPIO_CLR(keyPinTx2);
+          lastStateTx1 = false;
+          lastStateTx2 = false;
         }
+
+        if (ev.trxSel == SEL_TRX1)
+        {
+          if (ev.isOn != lastStateTx1)
+          {
+            // digitalWrite(keyPinTx1, ev.isOn ? HIGH : LOW);
+            ev.isOn ? GPIO_SET(keyPinTx1) : GPIO_CLR(keyPinTx1);
+
+            lastStateTx1 = ev.isOn;
+            lastOnTimeTx1 = ev.isOn ? now : lastOnTimeTx1;
+          }
+        }
+
+        if (ev.trxSel == SEL_TRX2)
+        {
+          if (ev.isOn != lastStateTx2)
+          {
+            // digitalWrite(keyPinTx2, ev.isOn ? HIGH : LOW);
+            ev.isOn ? GPIO_SET(keyPinTx2) : GPIO_CLR(keyPinTx2);
+
+            lastStateTx2 = ev.isOn;
+            lastOnTimeTx2 = ev.isOn ? now : lastOnTimeTx2;
+          }
+        }
+
+        lastTrxSel = ev.trxSel;
+        queueHead = (queueHead + 1) % MAX_EVENTS;
       }
 
-      lastTrxSel = ev.trxSel;
-      queueHead = (queueHead + 1) % MAX_EVENTS;
-    }
-  }
+}
+      */
 
   // ==== TRX ON安全対策（ONが長すぎる場合は強制OFF） ====
   if (lastStateTx1 && now - lastOnTimeTx1 > MAX_ON_DURATION)

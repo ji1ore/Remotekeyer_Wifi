@@ -1,8 +1,9 @@
 /*=============================================================================*
- * M5Stadk_RemoteKeyerWifi クライアント用ファームウェア  Ver1.01
+ * M5Stadk_RemoteKeyerWifi クライアント用ファームウェア  Ver1.011
  * M5Stack ATOM Lite 対応
  * Wifiプロファイル選択対応
  * ダイレクト通信対応
+ * 2025/12/08 処理安定化のための修正
  * Copyright (C) 2025- JI1ORE
  *=============================================================================*/
 #include <WiFi.h>
@@ -28,13 +29,6 @@ ColorProfile MagentaProfile = {"Magenta", 255, 0, 255};
 ColorProfile yellowProfile = {"Yellow", 255, 255, 0};
 ColorProfile cyanProfile = {"Cyan", 0, 255, 255};
 
-// ==== UDP設定 ====
-#define LOCAL_PORT 8888
-#define SERVER_PORT 8888
-WiFiUDP Udp;
-
-Adafruit_NeoPixel pixels(NUMPIXELS, LED_PIN, NEO_GRB + NEO_KHZ800);
-
 // ==== WiFi設定 ====
 struct WiFiProfile
 {
@@ -48,6 +42,7 @@ struct WiFiProfile
   ColorProfile *color;
 };
 
+
 WiFiProfile wifiProfiles[] = {
     {"LAN-1", "xxxxxxxx", IPAddress(192, 168, 0, 51), IPAddress(192, 168, 0, 1), IPAddress(255, 255, 255, 0), IPAddress(192, 168, 0, 50), false, &cyanProfile},
     {"iPhone1", "xxxxxxxx", IPAddress(172, 20, 10, 6), IPAddress(172, 20, 10, 1), IPAddress(255, 255, 255, 240), IPAddress(172, 20, 10, 5), false, &MagentaProfile},
@@ -56,11 +51,25 @@ WiFiProfile wifiProfiles[] = {
 const int profileCount = sizeof(wifiProfiles) / sizeof(wifiProfiles[0]);
 IPAddress serverIP;
 
+// ==== UDP設定 ====
+#define LOCAL_PORT 8888
+#define SERVER_PORT 8888
+WiFiUDP Udp;
+
+Adafruit_NeoPixel pixels(NUMPIXELS, LED_PIN, NEO_GRB + NEO_KHZ800);
+
 // ==== 動作パラメータ ====
 unsigned long MAX_ON_DURATION = 3000;
-const int PING_INTERVAL = 1000;
+const int PING_INTERVAL = 5000;
 const int ReCal_RTT = 5000;
 int keyRepeatCount = 2; // 即時変化パケットの重複送付回数
+const int SAMPLE_SEND_DUP_CNT = 2; // サンプリングパケットの重複送付回数
+const int SAMPLE_INTERVAL_MS = 3;  // サンプリングの周期(msec)
+const int SAMPLE_SEND_AMNT = 8;    // サンプリングパケットの送付サイズ(変更時は送付パケットの修正が必要)
+const int SAMPLE_SUPPRESS_MS = 3; // 即時送信後にサンプリングを抑制する時間
+// ==== 割り込み処理 ====
+const unsigned long DEBOUNCE_US = 3000;
+volatile unsigned long lastKeyChangeMicros = 0;
 
 // ==== 遅延分類 ====
 // ping返送時間(msec)
@@ -92,7 +101,7 @@ volatile bool immediateSendRequested = false;
 volatile bool keyState = false;
 volatile unsigned long lastIsrMicros = 0;
 
-unsigned long lastSendMicros = 0;
+//unsigned long lastSendMicros = 0;
 unsigned long lastOnMillis = 0;
 unsigned long lastBlinkMillis = 0;
 unsigned long lastPingMillis = 0;
@@ -116,16 +125,16 @@ int activeProfileIndex = -1;
 unsigned long profileSelectStart = 0;
 const unsigned long PROFILE_SELECT_WINDOW = 10000; // 10秒
 int selectedProfileIndex = 0;
+unsigned long fixedDelayLockUntil = 0;
 
 // ==== サンプリング用変数 ====
 static byte keyBuf = 0;
 static int sampleIndex = 0;
 static unsigned long sampleStartTimeMs = 0;
 static unsigned long lastSampleTimeMs = 0;
-const int SAMPLE_SEND_DUP_CNT = 2; // サンプリングパケットの重複送付回数
-const int SAMPLE_INTERVAL_MS = 3;  // サンプリングの周期(msec)
-const int SAMPLE_SEND_AMNT = 8;    // サンプリングパケットの送付サイズ(変更時は送付パケットの修正が必要)
 const int PACKET_SEND_INTERVAL_MS = SAMPLE_INTERVAL_MS * SAMPLE_SEND_AMNT;
+unsigned long lastImmediateSendMillis = 0;
+unsigned long sampleTimes[8];
 
 // ==== 関数プロトタイプ ====
 bool connectToWiFi();
@@ -148,9 +157,6 @@ long getAverageRtt()
   return sum / RTT_HISTORY_SIZE;
 }
 
-// ==== 割り込み処理 ====
-const unsigned long DEBOUNCE_US = 1000;
-
 void keyISR()
 {
   if (!timeSynced)
@@ -160,9 +166,9 @@ void keyISR()
     return;
   lastIsrMicros = now;
   keyState = (digitalRead(KEY_PIN) == LOW);
+  lastKeyChangeMicros = now; // ← 追加
   immediateSendRequested = true;
 }
-
 // ==== 初期化 ====
 void setup()
 {
@@ -246,7 +252,8 @@ void loop()
   {
     doSend = true;
     sendState = keyState;
-    delay(2);
+    unsigned long isrMicros = lastKeyChangeMicros; // ← 割り込み時刻を取得
+    // delay(2);
     immediateSendRequested = false;
   }
   interrupts();
@@ -256,22 +263,29 @@ void loop()
     fixedDelayLocked = true; // ① 遅延時間の再評価を防止
 
     currentKeyState = sendState;
-    uint64_t opTimeMs = nowMillis + delayOffsetMs + fixedDelayMs; // ② opTimeMsを1回だけ計算
-
+    uint64_t opTimeMs = (lastKeyChangeMicros / 1000) + delayOffsetMs + fixedDelayMs;
     int repeat = currentKeyState ? 1 : 3; // OFF時は3回送信
     for (int i = 0; i < repeat; i++)
     {
       sendKeyPacket(currentKeyState, trxCode, opTimeMs); // opTimeMsは固定
-      delay(1);                                          // WiFiスタック安定化（必要に応じて）
+      yield();                                           // WiFiスタック安定化（必要に応じて）
     }
 
-    lastSendMicros = nowMicros;
+    //lastSendMicros = nowMicros;
     lastOnMillis = currentKeyState ? nowMillis : lastOnMillis;
+    lastImmediateSendMillis = millis();
   }
 
   // ==== SAMPLE_INTERVAL_MSごとのサンプリング処理 ====
   if (timeSynced && millis() - lastSampleTimeMs >= SAMPLE_INTERVAL_MS)
   {
+    // 即時送信後は抑制
+    if (millis() - lastImmediateSendMillis < SAMPLE_SUPPRESS_MS)
+      return;
+    // 即時送信中はサンプリング送信をスキップ
+    if (immediateSendRequested)
+      return;
+
     lastSampleTimeMs = millis();
     bool down = (digitalRead(KEY_PIN) == LOW);
     if (sampleIndex == 0)
@@ -279,6 +293,9 @@ void loop()
       sampleStartTimeMs = millis();
       keyBuf = 0; // ← 初期化をここに移動
     }
+
+    sampleTimes[sampleIndex] = millis(); // ← ここに追加！
+
     if (down)
       keyBuf |= (1 << sampleIndex);
     sampleIndex++;
@@ -294,14 +311,17 @@ void loop()
       pkt[3] = (sampleStartTimeMs >> 8) & 0xFF;
       pkt[4] = sampleStartTimeMs & 0xFF;
       for (int i = 0; i < 8; i++)
-        pkt[5 + i] = i * SAMPLE_INTERVAL_MS;
+      {
+        byte delta = (byte)constrain(sampleTimes[i] - sampleStartTimeMs, 0, 255);
+        pkt[5 + i] = delta;
+      }
 
       for (int i = 0; i < SAMPLE_SEND_DUP_CNT; i++)
       {
         Udp.beginPacket(serverIP, SERVER_PORT);
         Udp.write(pkt, 13);
         Udp.endPacket();
-        delay(1); // WiFi安定化
+        yield(); // WiFi安定化
       }
 
       sampleIndex = 0;
@@ -355,13 +375,14 @@ void loop()
       else
         fixedDelayMs = DELAY_MAX;
 
-      fixedDelayLocked = true; // 通常はロックして安定運用
+      fixedDelayLocked = true;                // 通常はロックして安定運用
+      fixedDelayLockUntil = millis() + 30000; // 10秒間ロック維持
 
       lastPingMillis = nowMillis;
       lastPingSendMillis = nowMillis;
       blinkInterval = BLINK_INTERVAL_SYNC;
 
-      fixedDelayLocked = false;
+      // fixedDelayLocked = false;
       rttIndex = 0;
       for (int i = 0; i < RTT_HISTORY_SIZE; i++)
         rttHistory[i] = 0;
@@ -398,7 +419,7 @@ void loop()
       rttIndex = (rttIndex + 1) % RTT_HISTORY_SIZE;
       pingRttMs = getAverageRtt();
 
-      if (!fixedDelayLocked)
+      if (!fixedDelayLocked && !currentKeyState && (millis() - lastOnMillis > 1000))
       {
         if (pingRttMs <= RTT_THRESH_1)
           fixedDelayMs = DELAY_VERY_LOW;
@@ -535,6 +556,11 @@ void loop()
     uint64_t opTimeMs = nowMillis + delayOffsetMs + fixedDelayMs;
     sendKeyPacket(false, trxCode, opTimeMs);
   }
+
+  if (fixedDelayLocked && millis() > fixedDelayLockUntil)
+  {
+    fixedDelayLocked = false;
+  }
 }
 
 // ==== WiFi接続 ====
@@ -613,8 +639,10 @@ void sendKeyPacket(bool isOn, byte trxSel, uint64_t opTimeMs)
   pixels.show();
 }
 
-void flashRedBeforeRestart() {
-  for (int i = 0; i < 3; i++) {
+void flashRedBeforeRestart()
+{
+  for (int i = 0; i < 3; i++)
+  {
     pixels.setPixelColor(0, pixels.Color(255, 0, 0)); // 赤
     pixels.show();
     delay(100);
