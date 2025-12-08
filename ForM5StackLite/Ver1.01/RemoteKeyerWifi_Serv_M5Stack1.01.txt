@@ -1,15 +1,17 @@
 /*=============================================================================*
- * M5Stadk_RemoteKeyerWifi  サーバー用ファームウェア Ver1.011
+ * M5Stadk_RemoteKeyerWifi  サーバー用ファームウェア Ver1.012
  * M5Stack ATOM Lite 対応
  * Wifiプロファイル選択対応
  * ダイレクト通信対応
  * 2025/12/08 処理安定化のための修正
+ * 2025/12/09 前回選択プロファイルの保存
  * Copyright (C) 2025- JI1ORE
  *=============================================================================*/
 
 #include <WiFi.h>
 #include <WiFiUdp.h>
 #include <Adafruit_NeoPixel.h>
+#include "esp_wifi.h"
 #include <EEPROM.h>
 #define EEPROM_SIZE 4
 #define EEPROM_ADDR_PROFILE_INDEX 0
@@ -55,7 +57,7 @@ int activeProfileIndex = -1;
 #define SEL_TRX1 0x01
 #define SEL_TRX2 0x02
 #define MAX_EVENTS 1024 // イベントキューの最大サイズ
-#define SAME_MAX 10 // ON OFFの連続同一信号の場合の動作省略しきい値 指定回数目から削除
+#define SAME_MAX 10     // ON OFFの連続同一信号の場合の動作省略しきい値 指定回数目から削除
 #define MAX_ON_DURATION 3000
 #define MAX_FUTURE_WAIT 2000
 
@@ -86,7 +88,7 @@ byte lastTrxSel = 0x00;
 byte lastSeqNum = 0xFF;
 bool isReady = false;
 bool serverAlive = true;
-unsigned long dynamicTimeout = 8000;
+unsigned long dynamicTimeout = 12000;
 unsigned long profileSelectStart = 0;
 const unsigned long PROFILE_SELECT_WINDOW = 10000; // 10秒
 bool profileSelected = false;
@@ -113,15 +115,17 @@ int loadProfileIndexFromEEPROM();
 void setup()
 {
   Serial.begin(115200);
-  // EEPROM.begin(EEPROM_SIZE);
+  EEPROM.begin(EEPROM_SIZE);
+  selectedProfileIndex = loadProfileIndexFromEEPROM();
+
   pinMode(BUTTON_PIN, INPUT_PULLUP);
 
   pixels.begin();
   pixels.setBrightness(50); // 明るさ調整（0〜255）
+
   ColorProfile *c = serverProfiles[selectedProfileIndex].color;
   setLedColor(c->r, c->g, c->b);
 
-  selectedProfileIndex = loadProfileIndexFromEEPROM();
   profileSelectStart = millis();
 
   // 10秒間だけ選択可能
@@ -132,8 +136,6 @@ void setup()
     if (lastButtonState == HIGH && buttonState == LOW)
     {
       selectedProfileIndex = (selectedProfileIndex + 1) % profileCount;
-      // saveProfileIndexToEEPROM(selectedProfileIndex);
-
       c = serverProfiles[selectedProfileIndex].color;
       setLedColor(c->r, c->g, c->b);
       // Serial.printf("🔄 プロファイル切替: %d (%s)\n", selectedProfileIndex, serverProfiles[selectedProfileIndex].ssid);
@@ -142,12 +144,15 @@ void setup()
     delay(100);
   }
 
+  saveProfileIndexToEEPROM(selectedProfileIndex);
+  EEPROM.end();
+  delay(100);
+
   activeProfileIndex = selectedProfileIndex;
   c = serverProfiles[activeProfileIndex].color;
   setLedColor(c->r, c->g, c->b);
   gpio_pad_select_gpio((gpio_num_t)BUTTON_PIN);
   gpio_set_direction((gpio_num_t)BUTTON_PIN, GPIO_MODE_DISABLE);
-  // EEPROM.end();
 
   pinMode(keyPinTx1, OUTPUT);
   //  pinMode(keyPinTx2, OUTPUT);
@@ -416,8 +421,8 @@ void loop()
   {
     byte buf[5];
     Udp.read(buf, 5);
-    delay(10);
-    // Serial.printf("📩 SYNCリクエスト受信: buf[0]=0x%02X\n", buf[0]);
+    // delay(10);
+    //  Serial.printf("📩 SYNCリクエスト受信: buf[0]=0x%02X\n", buf[0]);
     if (buf[0] == 0xE0)
     {
       unsigned long serverRecvMs = now;
@@ -590,8 +595,10 @@ bool connectServerProfile()
     WiFi.mode(WIFI_AP);
     WiFi.softAPConfig(profile.localIP, profile.gateway, profile.subnet);
     WiFi.softAP(profile.ssid, profile.password);
+    WiFi.setTxPower(WIFI_POWER_19_5dBm);
     // Serial.printf("📡 APモード開始: SSID=%s, IP=%s\n", profile.ssid, profile.localIP.toString().c_str());
 
+    esp_wifi_set_ps(WIFI_PS_NONE);
     // クライアント接続待ち（最大30秒）
     unsigned long startWait = millis();
     while (millis() - startWait < 30000)
@@ -616,10 +623,13 @@ bool connectServerProfile()
       WiFi.config(profile.localIP, profile.gateway, profile.subnet);
     }
     WiFi.begin(profile.ssid, profile.password);
+
     for (int t = 0; t < 60; t++) // 最大30秒待つ
     {
       if (WiFi.status() == WL_CONNECTED)
       {
+
+        esp_wifi_set_ps(WIFI_PS_NONE);
         setLedColor(profile.color->r, profile.color->g, profile.color->b);
         // Serial.printf("✅ 接続成功: SSID=%s, IP=%s\n", profile.ssid, WiFi.localIP().toString().c_str());
         return true;

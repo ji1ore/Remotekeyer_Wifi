@@ -1,14 +1,19 @@
 /*=============================================================================*
- * M5Stadk_RemoteKeyerWifi クライアント用ファームウェア  Ver1.011
+ * M5Stadk_RemoteKeyerWifi クライアント用ファームウェア  Ver1.012
  * M5Stack ATOM Lite 対応
  * Wifiプロファイル選択対応
  * ダイレクト通信対応
- * 2025/12/08 処理安定化のための修正
+ * 2025/12/08 処理安定化のための修正 
+ * 2025/12/09 前回選択プロファイルの保存
  * Copyright (C) 2025- JI1ORE
  *=============================================================================*/
 #include <WiFi.h>
 #include <WiFiUdp.h>
 #include <Adafruit_NeoPixel.h>
+#include "esp_wifi.h"
+#include <EEPROM.h>
+#define EEPROM_SIZE 4
+#define EEPROM_ADDR_PROFILE_INDEX 0
 
 // ==== ピン定義 ====
 const int KEY_PIN = 19;
@@ -42,7 +47,6 @@ struct WiFiProfile
   ColorProfile *color;
 };
 
-
 WiFiProfile wifiProfiles[] = {
     {"LAN-1", "xxxxxxxx", IPAddress(192, 168, 0, 51), IPAddress(192, 168, 0, 1), IPAddress(255, 255, 255, 0), IPAddress(192, 168, 0, 50), false, &cyanProfile},
     {"iPhone1", "xxxxxxxx", IPAddress(172, 20, 10, 6), IPAddress(172, 20, 10, 1), IPAddress(255, 255, 255, 240), IPAddress(172, 20, 10, 5), false, &MagentaProfile},
@@ -62,11 +66,11 @@ Adafruit_NeoPixel pixels(NUMPIXELS, LED_PIN, NEO_GRB + NEO_KHZ800);
 unsigned long MAX_ON_DURATION = 3000;
 const int PING_INTERVAL = 5000;
 const int ReCal_RTT = 5000;
-int keyRepeatCount = 2; // 即時変化パケットの重複送付回数
+int keyRepeatCount = 2;            // 即時変化パケットの重複送付回数
 const int SAMPLE_SEND_DUP_CNT = 2; // サンプリングパケットの重複送付回数
 const int SAMPLE_INTERVAL_MS = 3;  // サンプリングの周期(msec)
 const int SAMPLE_SEND_AMNT = 8;    // サンプリングパケットの送付サイズ(変更時は送付パケットの修正が必要)
-const int SAMPLE_SUPPRESS_MS = 3; // 即時送信後にサンプリングを抑制する時間
+const int SAMPLE_SUPPRESS_MS = 3;  // 即時送信後にサンプリングを抑制する時間
 // ==== 割り込み処理 ====
 const unsigned long DEBOUNCE_US = 3000;
 volatile unsigned long lastKeyChangeMicros = 0;
@@ -101,7 +105,7 @@ volatile bool immediateSendRequested = false;
 volatile bool keyState = false;
 volatile unsigned long lastIsrMicros = 0;
 
-//unsigned long lastSendMicros = 0;
+// unsigned long lastSendMicros = 0;
 unsigned long lastOnMillis = 0;
 unsigned long lastBlinkMillis = 0;
 unsigned long lastPingMillis = 0;
@@ -119,8 +123,7 @@ bool currentKeyState = false;
 int lostPingCount = 0;
 bool pongReceived = true; // pong応答が来たかどうか
 
-const unsigned long DEFAULT_TIMEOUT_MIN = 4000;
-const unsigned long DEFAULT_TIMEOUT_MAX = 12000;
+const unsigned long DEFAULT_TIMEOUT = 12000;
 int activeProfileIndex = -1;
 unsigned long profileSelectStart = 0;
 const unsigned long PROFILE_SELECT_WINDOW = 10000; // 10秒
@@ -142,6 +145,8 @@ void requestMillisSync();
 void sendKeyPacket(bool isOn, byte trxSel, uint64_t opTimeMs);
 void setLedColor(uint8_t r, uint8_t g, uint8_t b);
 void flashRedBeforeRestart();
+void saveProfileIndexToEEPROM(int index);
+int loadProfileIndexFromEEPROM();
 
 // ==== RTT履歴 ====
 const int RTT_HISTORY_SIZE = 5;
@@ -173,6 +178,8 @@ void keyISR()
 void setup()
 {
   Serial.begin(115200);
+  EEPROM.begin(EEPROM_SIZE);
+  selectedProfileIndex = loadProfileIndexFromEEPROM();
 
   pinMode(BUTTON_PIN, INPUT_PULLUP);
   pinMode(KEY_PIN, INPUT_PULLUP);
@@ -201,8 +208,10 @@ void setup()
     delay(100);
   }
 
-  activeProfileIndex = selectedProfileIndex;
+  saveProfileIndexToEEPROM(selectedProfileIndex);
+  EEPROM.end();
 
+  activeProfileIndex = selectedProfileIndex;
   c = wifiProfiles[activeProfileIndex].color;
   setLedColor(c->r, c->g, c->b);
   gpio_pad_select_gpio((gpio_num_t)BUTTON_PIN);
@@ -240,7 +249,7 @@ void loop()
       requestMillisSync();
       syncRequested = true;
       lastSyncRetryMillis = millis();
-      // Serial.println("SYNC要求を送信しました");
+      //Serial.println("SYNC要求を送信しました");
     }
   }
 
@@ -271,7 +280,7 @@ void loop()
       yield();                                           // WiFiスタック安定化（必要に応じて）
     }
 
-    //lastSendMicros = nowMicros;
+    // lastSendMicros = nowMicros;
     lastOnMillis = currentKeyState ? nowMillis : lastOnMillis;
     lastImmediateSendMillis = millis();
   }
@@ -347,7 +356,7 @@ void loop()
       if (offset < 3000)
       {
         // サーバー が3秒以上先に動いていない場合は再起動
-        Serial.println("サーバーの起動時間が大幅に巻き戻りました。クライアントを再起動します。");
+        //Serial.println("サーバーの起動時間が大幅に巻き戻りました。クライアントを再起動します。");
         flashRedBeforeRestart();
         ESP.restart(); // ← ESP32をソフトリセット
         return;
@@ -453,7 +462,7 @@ void loop()
       if (!currentKeyState)
       { // キー送信中は表示しない
         lostPingCount++;
-        // Serial.printf("⚠️ Ping lost! Count: %d (last RTT=%ld ms)\n", lostPingCount, pingRttMs);
+        //Serial.printf("⚠️ Ping lost! Count: %d (last RTT=%ld ms)\n", lostPingCount, pingRttMs);
       }
       else
       {
@@ -503,7 +512,7 @@ void loop()
     timeSynced = false;
     blinkInterval = BLINK_INTERVAL_WIFI;
     fixedDelayLocked = false;
-    // Serial.println("サーバとの接続タイムアウト。待機状態に戻ります。");
+    //Serial.println("サーバとの接続タイムアウト。待機状態に戻ります。");
   }
 
   // 5秒以上キー押下がない場合は遅延再評価を許可
@@ -536,6 +545,7 @@ void loop()
     timeSynced = false;
     blinkInterval = BLINK_INTERVAL_WIFI;
     fixedDelayLocked = false;
+    esp_wifi_set_ps(WIFI_PS_NONE);
   }
 
   // ==== SYNC再送の自動化 ====
@@ -543,7 +553,7 @@ void loop()
   {
     requestMillisSync();
     lastSyncRetryMillis = millis();
-    // Serial.println("SYNC再送要求を送信しました");
+    //Serial.println("SYNC再送要求を送信しました");
   }
 
   if (!timeSynced)
@@ -577,8 +587,8 @@ bool connectToWiFi()
     {
       serverIP = profile.serverIP;
       int rssi = WiFi.RSSI();
-      dynamicTimeout = constrain(map(rssi, -90, -30, DEFAULT_TIMEOUT_MAX, DEFAULT_TIMEOUT_MIN),
-                                 DEFAULT_TIMEOUT_MIN, DEFAULT_TIMEOUT_MAX);
+      dynamicTimeout = DEFAULT_TIMEOUT;
+
       // Serial.printf("✅ 接続成功: SSID=%s, IP=%s\n", profile.ssid, WiFi.localIP().toString().c_str());
       // Serial.printf("✅ 接続成功: SSID=%s", profile.ssid);
       return true;
@@ -650,4 +660,19 @@ void flashRedBeforeRestart()
     pixels.show();
     delay(100);
   }
+}
+
+
+void saveProfileIndexToEEPROM(int index)
+{
+  EEPROM.write(EEPROM_ADDR_PROFILE_INDEX, index);
+  EEPROM.commit();
+}
+
+int loadProfileIndexFromEEPROM()
+{
+  byte val = EEPROM.read(EEPROM_ADDR_PROFILE_INDEX);
+  if (val < profileCount)
+    return val;
+  return 0; // デフォルト
 }
