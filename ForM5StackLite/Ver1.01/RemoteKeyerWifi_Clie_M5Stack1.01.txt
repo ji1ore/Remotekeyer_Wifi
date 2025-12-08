@@ -66,13 +66,13 @@ Adafruit_NeoPixel pixels(NUMPIXELS, LED_PIN, NEO_GRB + NEO_KHZ800);
 unsigned long MAX_ON_DURATION = 3000;
 const int PING_INTERVAL = 5000;
 const int ReCal_RTT = 5000;
-int keyRepeatCount = 2;            // 即時変化パケットの重複送付回数
-const int SAMPLE_SEND_DUP_CNT = 2; // サンプリングパケットの重複送付回数
-const int SAMPLE_INTERVAL_MS = 3;  // サンプリングの周期(msec)
+int keyRepeatCount = 10;            // 即時変化パケットの重複送付回数
+const int SAMPLE_SEND_DUP_CNT = 1; // サンプリングパケットの重複送付回数
+const int SAMPLE_INTERVAL_MS = 10;  // サンプリングの周期(msec)
 const int SAMPLE_SEND_AMNT = 8;    // サンプリングパケットの送付サイズ(変更時は送付パケットの修正が必要)
-const int SAMPLE_SUPPRESS_MS = 3;  // 即時送信後にサンプリングを抑制する時間
+const int SAMPLE_SUPPRESS_MS = 10;  // 即時送信後にサンプリングを抑制する時間
 // ==== 割り込み処理 ====
-const unsigned long DEBOUNCE_US = 3000;
+const unsigned long DEBOUNCE_US = 5000;
 volatile unsigned long lastKeyChangeMicros = 0;
 
 // ==== 遅延分類 ====
@@ -86,11 +86,11 @@ const int RTT_THRESH_6 = 100;
 const int RTT_THRESH_7 = 200;
 
 // ping返送時間間隔ごとの遅延時間定義(msec)
-const int DELAY_VERY_LOW = 50;    // RTT_THRESH_1以下
-const int DELAY_LOW = 60;         // RTT_THRESH_2以下
-const int DELAY_MID = 75;         // RTT_THRESH_3以下
+const int DELAY_VERY_LOW = 100;    // RTT_THRESH_1以下
+const int DELAY_LOW = 100;         // RTT_THRESH_2以下
+const int DELAY_MID = 100;         // RTT_THRESH_3以下
 const int DELAY_HIGH = 100;       // RTT_THRESH_4以下
-const int DELAY_VERY_HIGH = 125;  // RTT_THRESH_5以下
+const int DELAY_VERY_HIGH = 150;  // RTT_THRESH_5以下
 const int DELAY_VERY2_HIGH = 150; // RTT_THRESH_6以下
 const int DELAY_VERY3_HIGH = 250; // RTT_THRESH_7以下
 const int DELAY_MAX = 500;        // RTT_THRESH_7超
