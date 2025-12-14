@@ -1,0 +1,13 @@
+[env:m5stack-atom]
+platform = espressif32
+board = m5stack-atom
+framework = arduino
+monitor_speed = 115200
+build_flags = -DM5ATOMLite
+#build_flags = -DM5ATOMS3Lite
+#build_flags = -DESPrONE
+#              -DLoadFromSource
+lib_deps =
+  adafruit/Adafruit NeoPixel @ ^1.12.0
+	m5stack/M5Unified
+	m5stack/M5GFX
