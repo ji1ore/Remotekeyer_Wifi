@@ -1,0 +1,83 @@
+#*=============================================================================*
+#M5Stadk_RemoteKeyerWifi クライアントWifiプロファイル定義 Ver1.02
+#[Profile]始まりを1プロファイルとして読み込みます。合計5プロファイルまで。
+#サーバー側と対になる設定をCOLORであわせてください。
+#エラーチェックは入れていませんが、定義を許容する値はどこかでエラーになります。
+#SSID、PASS、HOSTNAME、HASIP、MODEは必須値です。
+#クライアント側はSERVERHOSTNAMEも必須値です。
+#各IPアドレスは、0.0.0.0が定義なしの意味になります。
+#MODE サーバ側の挙動するかをクライアント側にも記載ください。
+#MODE=STA ステーションモード 
+#MODE=AP アクセスポイントモード
+#HASIP=IP IPアドレス直指定モード この場合はIP、GW、MASK、SEREVERを設定願います。
+#HASIP=DHCP DHCPでIPアドレスを取得します。mDNSを使い、サーバの名前解決をします。
+#サーバ側：APモードの場合、MODEはIPとしてください。
+#DHCPモードで動かない場合はルータの設定を確認ください。
+#COLORの設定可能値はMagenta Yellow Cyan Red Blue Green Whiteです。
+#Copyright (C) 2025- JI1ORE
+#*=============================================================================*
+
+[Profile]
+SSID=LAN-1
+PASS=testtest01
+IP=192.168.0.51
+GW=192.168.0.1
+MASK=255.255.255.0
+SERVER=192.168.0.50
+MODE=STA
+HASIP=IP
+COLOR=Cyan
+HOSTNAME=RKCLIENT01
+SERVERHOSTNAME=RKSERVER01
+
+[Profile]
+SSID=iPhone1
+PASS=testtest01
+IP=172.20.10.6
+GW=172.20.10.1
+MASK=255.255.255.240
+SERVER=172.20.10.5
+MODE=STA
+HASIP=IP
+COLOR=Magenta
+HOSTNAME=RKCLIENT01
+SERVERHOSTNAME=RKSERVER01
+
+[Profile]
+SSID=RemoteKeyer-AP1
+PASS=password123
+IP=192.168.40.2
+GW=192.168.40.1
+MASK=255.255.255.0
+SERVER=192.168.40.1
+MODE=AP
+HASIP=IP
+COLOR=Yellow
+HOSTNAME=RKCLIENT01
+SERVERHOSTNAME=RKSERVER01
+
+[Profile]
+SSID=LAN-1
+PASS=testtest01
+IP=0.0.0.0
+GW=0.0.0.0
+MASK=0.0.0.0
+SERVER=0.0.0.0
+MODE=STA
+HASIP=DHCP
+COLOR=White
+HOSTNAME=RKCLIENT01
+SERVERHOSTNAME=RKSERVER01
+
+[Profile]
+SSID=RemoteKeyer-AP1
+PASS=password123
+IP=0.0.0.0
+GW=0.0.0.0
+MASK=0.0.0.0
+SERVER=0.0.0.0
+MODE=AP
+HASIP=DHCP
+COLOR=Blue
+HOSTNAME=RKCLIENT01
+SERVERHOSTNAME=RKSERVER01
