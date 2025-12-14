@@ -5,7 +5,6 @@ framework = arduino
 monitor_speed = 115200
 #build_flags = -DM5ATOMLite
 build_flags = -DM5ATOMS3Lite
-#build_flags = -DESPrONE
 #              -DLoadFromSource
 lib_deps =
   adafruit/Adafruit NeoPixel @ ^1.12.0
