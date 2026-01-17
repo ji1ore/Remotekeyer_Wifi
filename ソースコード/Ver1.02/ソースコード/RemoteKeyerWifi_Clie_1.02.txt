@@ -1,6 +1,6 @@
 /*=============================================================================*
  * M5Stadk_RemoteKeyerWifi クライアント用ファームウェア  Ver1.02
- * M5Stack ATOM S3 Lite 対応 ATOM Lite/ESPrONEと共用ソース化
+ * M5Stack ATOM S3 Lite 対応 ATOM Liteと共用ソース化
  * Wifiプロファイルのソース分離/SDカードから取り込み、EEPROMへ書き込み/読み出し
  * Wifiプロファイル選択対応
  * DHCP対応
@@ -58,11 +58,6 @@ const int SD_SPI_CS_PIN = -1;
 const int SD_SPI_SCK_PIN = 7;
 const int SD_SPI_MISO_PIN = 8;
 const int SD_SPI_MOSI_PIN = 6;
-#elif ESPrONE
-const int KEY_PIN = 16;
-const int LED_PIN = 17;
-const int TRX_PIN = 15;
-const int BUTTON_PIN = 99;
 #endif
 #define NUMPIXELS 1
 #define ESP_INTR_FLAG_DEFAULT 0
@@ -105,9 +100,9 @@ WiFiProfile wifiProfiles[MAX_WIFI_PROFILES];
 int profileCount = 0;
 #ifdef LoadFromSource
 WiFiProfile defaultProfiles[] = {
-    {"LAN-1", "xxxxxxxx", IPAddress(192, 168, 0, 51), IPAddress(192, 168, 0, 1), IPAddress(255, 255, 255, 0), IPAddress(192, 168, 0, 50), false,false, &cyanProfile,"RKCLIENT01", "RKSERVER01"},
-    {"iPhone1", "xxxxxxxx", IPAddress(172, 20, 10, 6), IPAddress(172, 20, 10, 1), IPAddress(255, 255, 255, 240), IPAddress(172, 20, 10, 5), false,false, &MagentaProfile,"RKCLIENT01", "RKSERVER01"},
-    {"RemoteKeyer-AP1", "password123", IPAddress(192, 168, 40, 2), IPAddress(192, 168, 40, 1), IPAddress(255, 255, 255, 0), IPAddress(192, 168, 40, 1), true,false, &yellowProfile,"RKCLIENT01", "RKSERVER01"}};
+    {"UENO-a", "hogehoge33", IPAddress(192, 168, 1, 51), IPAddress(192, 168, 1, 1), IPAddress(255, 255, 255, 0), IPAddress(192, 168, 1, 50), false,false, &cyanProfile,"RKCLIENT01", "RKSERVER01"},
+    {"Ueno-mini1", "hogehoge33", IPAddress(172, 20, 10, 6), IPAddress(172, 20, 10, 1), IPAddress(255, 255, 255, 240), IPAddress(172, 20, 10, 5), false,false, &MagentaProfile,"RKCLIENT01", "RKSERVER01"},
+    {"RemoteKeyer-AP", "password123", IPAddress(192, 168, 4, 2), IPAddress(192, 168, 4, 1), IPAddress(255, 255, 255, 0), IPAddress(192, 168, 4, 1), true,false, &yellowProfile,"RKCLIENT01", "RKSERVER01"}};
 #endif
 
 IPAddress serverIP;
@@ -142,7 +137,17 @@ const int RTT_THRESH_5 = 75;
 const int RTT_THRESH_6 = 100;
 const int RTT_THRESH_7 = 200;
 
-// ping返送時間間隔ごとの遅延時間定義(msec)
+// ping返送時間間隔ごとの遅延時間定義(msec) 
+/* すべて100msecにする */
+const int DELAY_VERY_LOW = 100;   // RTT_THRESH_1以下
+const int DELAY_LOW = 100;        // RTT_THRESH_2以下
+const int DELAY_MID = 100;        // RTT_THRESH_3以下
+const int DELAY_HIGH = 100;       // RTT_THRESH_4以下
+const int DELAY_VERY_HIGH = 100;  // RTT_THRESH_5以下
+const int DELAY_VERY2_HIGH = 100; // RTT_THRESH_6以下
+const int DELAY_VERY3_HIGH = 100; // RTT_THRESH_7以下
+const int DELAY_MAX = 100;        // RTT_THRESH_7超
+/*
 const int DELAY_VERY_LOW = 100;   // RTT_THRESH_1以下
 const int DELAY_LOW = 100;        // RTT_THRESH_2以下
 const int DELAY_MID = 100;        // RTT_THRESH_3以下
@@ -151,6 +156,7 @@ const int DELAY_VERY_HIGH = 150;  // RTT_THRESH_5以下
 const int DELAY_VERY2_HIGH = 150; // RTT_THRESH_6以下
 const int DELAY_VERY3_HIGH = 250; // RTT_THRESH_7以下
 const int DELAY_MAX = 500;        // RTT_THRESH_7超
+*/
 
 const unsigned long BLINK_INTERVAL_WIFI = 1000;
 const unsigned long BLINK_INTERVAL_SYNC = 300;
@@ -254,14 +260,15 @@ void setup()
   {
     wifiProfiles[i] = defaultProfiles[i];
   }
-#else  
+#endif
   auto cfg = M5.config();
   cfg.external_spk = false; // 外部スピーカー無効
   cfg.internal_mic = false; // 内蔵マイク無効
   cfg.output_power = false; // 電源制御ピン無効
   cfg.clear_display = true; // 画面初期化あり（必要に応じて）
   M5.begin(cfg);
-
+#ifdef LoadFromSource
+#else
   bool sdAvailable = false;
   delay(500);
   SPI.begin(SD_SPI_SCK_PIN, SD_SPI_MISO_PIN, SD_SPI_MOSI_PIN, SD_SPI_CS_PIN);
@@ -300,9 +307,6 @@ void setup()
   {
     // Serial.println("SDカードが見つからないか、設定ファイルがありません。EEPROMから復元します。");
   }
-#endif
-
-  selectedProfileIndex = loadProfileIndexFromEEPROM();
 
   // ✅ EEPROMからプロファイルを復元
   if (!restoreProfilesFromEEPROM())
@@ -321,6 +325,10 @@ void setup()
     selectedProfileIndex = 0;
   }
 
+
+#endif
+  
+  selectedProfileIndex = loadProfileIndexFromEEPROM();
   activeProfileIndex = selectedProfileIndex;
 
   if (profileCount == 0)
@@ -335,6 +343,7 @@ void setup()
     // Serial.println("⚠️ EEPROMのプロファイルインデックスが無効です。0にリセットします");
     selectedProfileIndex = 0;
   }
+
   activeProfileIndex = selectedProfileIndex;
 
   pinMode(BUTTON_PIN, INPUT_PULLUP);
@@ -342,10 +351,6 @@ void setup()
 
   profileSelectStart = millis();
 
-#ifdef ESPrONE
-  pinMode(LED_PIN, OUTPUT);
-  digitalWrite(LED_PIN, LOW);
-#else
   initLed();
 
   ColorProfile *c = wifiProfiles[selectedProfileIndex].color;
@@ -373,8 +378,6 @@ void setup()
   }
 
   setLedFromProfileIndex(selectedProfileIndex);
-
-#endif
 
   saveProfileIndexToEEPROM(selectedProfileIndex);
   EEPROM.end();
@@ -706,9 +709,7 @@ void loop()
   if (nowMillis - lastBlinkMillis >= blinkInterval)
   {
     ledState = !ledState;
-#ifdef ESPrONE
-    digitalWrite(LED_PIN, ledState ? HIGH : LOW);
-#else
+
     if (ledState)
     {
       setLedColorFromProfile(&GreenProfile);
@@ -718,7 +719,7 @@ void loop()
       clearLed();
     }
 
-#endif
+
     lastBlinkMillis = nowMillis;
   }
 
@@ -759,37 +760,6 @@ void loop()
 }
 
 // ==== WiFi接続 ====
-#ifdef ESPrONE
-bool connectToWiFi()
-{
-  for (int i = 0; i < profileCount; i++)
-  {
-    WiFiProfile profile = wifiProfiles[i]; // ← & を外して構文を簡潔に
-    if (!profile.isApMode && profile.hostname && strlen(profile.hostname) > 0)
-    {
-      WiFi.setHostname(profile.hostname);
-    }
-    if (profile.hasIP)
-    {
-      WiFi.config(profile.localIP, profile.gateway, profile.subnet); // ← 固定IPのときだけ！
-    }
-    WiFi.begin(profile.ssid, profile.password);
-    for (int t = 0; t < 10; t++)
-    {
-      if (WiFi.status() == WL_CONNECTED)
-      {
-        serverIP = profile.serverIP;
-        int rssi = WiFi.RSSI();
-        dynamicTimeout = DEFAULT_TIMEOUT;
-
-        return true;
-      }
-      delay(500);
-    }
-  }
-  return false;
-}
-#else
 bool connectToWiFi()
 {
 
@@ -804,6 +774,12 @@ bool connectToWiFi()
   }
   esp_wifi_set_ps(WIFI_PS_NONE);
   WiFi.begin(profile.ssid, profile.password);
+  
+  if (profile.isApMode) {
+    esp_wifi_set_max_tx_power(84);
+  }
+
+
   for (int t = 0; t < 60; t++)
   {
     if (WiFi.status() == WL_CONNECTED)
@@ -827,7 +803,6 @@ bool connectToWiFi()
 
   return false;
 }
-#endif
 
 // ==== SYNC要求（時刻補正専用） ====
 void requestMillisSync()

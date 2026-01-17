@@ -1,6 +1,7 @@
 /*=============================================================================*
- * M5Stadk_RemoteKeyerWifi  サーバー用ファームウェア Ver1.02
- * M5Stack ATOM S3 Lite 対応 ATOM Lite/ESPrONEと共用ソース化
+ * M5Stadk_RemoteKeyerWifi サーバー用ファームウェア  Ver1.02
+ * M5Stack ATOM S3 Lite 対応 ATOM Liteと共用ソース化
+ * Wifiプロファイルのソース分離/SDカードから取り込み、EEPROMへ書き込み/読み出し
  * Wifiプロファイル選択対応
  * DHCP対応
  * ダイレクト通信対応
@@ -59,11 +60,6 @@ const int SD_SPI_CS_PIN = -1;
 const int SD_SPI_SCK_PIN = 7;
 const int SD_SPI_MISO_PIN = 8;
 const int SD_SPI_MOSI_PIN = 6;
-#elif ESPrONE
-const int keyPinTx1 = 16;
-const int keyPinTx2 = 17;
-const int LED_PIN = 14; // SYNC完了表示用LED
-const int BUTTON_PIN = 99;
 #endif
 #define SD_Filename "/wifi_server_profile.txt"
 
@@ -101,13 +97,13 @@ struct WiFiProfile
 WiFiProfile wifiProfiles[MAX_WIFI_PROFILES];
 int profileCount = 0;
 #ifdef LoadFromSource
-ServerProfile serverProfiles[] = {
-    {"LAN-1", "xxxxxxxx",
-     IPAddress(192, 168, 0, 50), IPAddress(192, 168, 0, 1), IPAddress(255, 255, 255, 0), true, false, &cyanProfile, "RKSERVER01"},
-    {"iPhone1", "xxxxxxxx",
+WiFiProfile defaultProfiles[] = {
+    {"LAN-1", "password",
+     IPAddress(192, 168, 1, 50), IPAddress(192, 168, 1, 1), IPAddress(255, 255, 255, 0), true, false, &cyanProfile, "RKSERVER01"},
+    {"Wifi1", "password",
      IPAddress(172, 20, 10, 5), IPAddress(172, 20, 10, 1), IPAddress(255, 255, 255, 240), true, false, &MagentaProfile, "RKSERVER01"},
-    {"RemoteKeyer-AP1", "password123",
-     IPAddress(192, 168, 4, 10), IPAddress(192, 168, 4, 10), IPAddress(255, 255, 255, 0), true, true, &yellowProfile, "RKSERVER01"}};
+    {"RemoteKeyer-AP", "password123",
+     IPAddress(192, 168, 4, 1), IPAddress(192, 168, 4, 1), IPAddress(255, 255, 255, 0), true, true, &yellowProfile, "RKSERVER01"}};
 #endif
 
 int activeProfileIndex = -1;
@@ -187,7 +183,7 @@ void setup()
   {
     wifiProfiles[i] = defaultProfiles[i];
   }
-#else
+#endif
   auto cfg = M5.config();
   cfg.external_spk = false; // 外部スピーカー無効
   cfg.internal_mic = false; // 内蔵マイク無効
@@ -195,6 +191,8 @@ void setup()
   cfg.clear_display = true; // 画面初期化あり（必要に応じて）
   M5.begin(cfg);
 
+#ifdef LoadFromSource
+#else
   bool sdAvailable = false;
   delay(100);
   pinMode(SD_SPI_MISO_PIN, INPUT_PULLDOWN);
@@ -242,7 +240,6 @@ void setup()
     }
     // Serial.println("通常モード。EEPROMから復元します。");
   }
-#endif
   selectedProfileIndex = loadProfileIndexFromEEPROM();
   activeProfileIndex = selectedProfileIndex;
 
@@ -257,8 +254,11 @@ void setup()
       delay(300);
     }
   }
+#endif
 
   selectedProfileIndex = loadProfileIndexFromEEPROM();
+  activeProfileIndex = selectedProfileIndex;
+
   if (selectedProfileIndex >= profileCount)
   {
     selectedProfileIndex = 0;
@@ -276,12 +276,6 @@ void setup()
   initLed();
   profileSelectStart = millis();
 
-#ifdef ESPrONE
-
-  pinMode(LED_PIN, OUTPUT);
-  digitalWrite(LED_PIN, LOW);
-
-#else
   setLedFromProfileIndex(selectedProfileIndex);
 
   // 10秒間だけ選択可能
@@ -303,8 +297,6 @@ void setup()
   setLedFromProfileIndex(activeProfileIndex);
   gpio_pad_select_gpio((gpio_num_t)BUTTON_PIN);
   gpio_set_direction((gpio_num_t)BUTTON_PIN, GPIO_MODE_DISABLE);
-
-#endif
 
   saveProfileIndexToEEPROM(selectedProfileIndex);
   EEPROM.end();
@@ -664,9 +656,6 @@ void loop()
     {
       ledState = !ledState;
 
-#ifdef ESPrONE
-      ledState ? GPIO_SET(LED_PIN) : GPIO_CLR(LED_PIN);
-#else
       if (ledState)
       {
         setLedColorFromProfile(&BlueProfile);
@@ -676,7 +665,6 @@ void loop()
         setLedColorFromProfile(&RedProfile);
       }
       pixels.show();
-#endif
       lastBlinkTime = now;
     }
   }
