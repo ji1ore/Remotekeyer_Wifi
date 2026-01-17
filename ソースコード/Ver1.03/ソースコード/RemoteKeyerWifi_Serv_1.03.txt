@@ -1,0 +1,1064 @@
+/*=============================================================================*
+ * M5Stadk_RemoteKeyerWifi  サーバー用ファームウェア Ver1.03
+ * M5Stack ATOM S3 Lite 対応 ATOM Liteと共用ソース化
+ * Wifiプロファイル選択対応
+ * DHCP対応
+ * ダイレクト通信対応
+ * ダイレクト通信の動作安定化
+ * Copyright (C) 2025- JI1ORE
+ *=============================================================================*/
+
+#include <WiFi.h>
+#include <WiFiUdp.h>
+#include <ESPmDNS.h>
+#include <Adafruit_NeoPixel.h>
+#include "esp_wifi.h"
+#include <EEPROM.h>
+#include <SD.h>
+#include "M5Unified.h"
+#define EEPROM_ADDR_PROFILE_INDEX 0
+#define EEPROM_ADDR_PROFILE_BASE 16
+#define MAX_WIFI_PROFILES 5
+#define EEPROM_SIZE (sizeof(WiFiProfileEEPROM) * MAX_WIFI_PROFILES + 16)
+
+#define MAX_SSID_LEN 32
+#define MAX_PASS_LEN 64
+#define MAX_HOSTNAME_LEN 32
+#define PROFILE_MAGIC 0xA5
+
+struct __attribute__((packed)) WiFiProfileEEPROM
+{
+  uint8_t magic; // データ有効フラグ
+  char ssid[MAX_SSID_LEN];
+  char password[MAX_PASS_LEN];
+  uint8_t localIP[4];
+  uint8_t gateway[4];
+  uint8_t subnet[4];
+  bool hasIP;
+  bool isApMode;
+  uint8_t colorId;
+  char hostname[MAX_HOSTNAME_LEN];
+};
+
+#ifdef M5ATOMLite
+const int keyPinTx1 = 22;
+const int keyPinTx2 = 22;
+// どちらの信号が来ても22で処理
+const int LED_PIN = 27;
+const int BUTTON_PIN = 39;
+const int SD_SPI_CS_PIN = 22;
+const int SD_SPI_SCK_PIN = 23;
+const int SD_SPI_MISO_PIN = 33;
+const int SD_SPI_MOSI_PIN = 19;
+#elif M5ATOMS3Lite
+const int keyPinTx1 = 5;
+const int keyPinTx2 = 5;
+// どちらの信号が来ても22で処理
+const int LED_PIN = 35;
+const int BUTTON_PIN = 41;
+const int SD_SPI_CS_PIN = -1;
+const int SD_SPI_SCK_PIN = 7;
+const int SD_SPI_MISO_PIN = 8;
+const int SD_SPI_MOSI_PIN = 6;
+#endif
+#define SD_Filename "/wifi_server_profile.txt"
+
+// ==== 色設定 ====
+struct ColorProfile
+{
+  const char *name;
+  uint8_t r;
+  uint8_t g;
+  uint8_t b;
+};
+
+ColorProfile MagentaProfile = {"Magenta", 255, 0, 255};
+ColorProfile yellowProfile = {"Yellow", 255, 255, 0};
+ColorProfile cyanProfile = {"Cyan", 0, 255, 255};
+ColorProfile RedProfile = {"Red", 255, 0, 0};
+ColorProfile BlueProfile = {"Blue", 0, 0, 255};
+ColorProfile GreenProfile = {"Green", 0, 255, 0};
+ColorProfile WhiteProfile = {"White", 255, 255, 255};
+
+// ==== WiFi接続プロファイル（複数対応） ====
+struct WiFiProfile
+{
+  const char *ssid;
+  const char *password;
+  IPAddress localIP;
+  IPAddress gateway;
+  IPAddress subnet;
+  bool hasIP;
+  bool isApMode;
+  ColorProfile *color;
+  const char *hostname;
+};
+
+WiFiProfile wifiProfiles[MAX_WIFI_PROFILES];
+int profileCount = 0;
+#ifdef LoadFromSource
+WiFiProfile defaultProfiles[] = {
+    {"UENO-a", "hogehoge33",
+     IPAddress(192, 168, 1, 50), IPAddress(192, 168, 1, 1), IPAddress(255, 255, 255, 0), true, false, &cyanProfile, "RKSERVER01"},
+    {"Ueno-mini1", "hogehoge33",
+     IPAddress(172, 20, 10, 5), IPAddress(172, 20, 10, 1), IPAddress(255, 255, 255, 240), true, false, &MagentaProfile, "RKSERVER01"},
+    {"RemoteKeyer-AP", "password123",
+     IPAddress(192, 168, 4, 1), IPAddress(192, 168, 4, 1), IPAddress(255, 255, 255, 0), true, true, &yellowProfile, "RKSERVER01"}};
+#endif
+
+int activeProfileIndex = -1;
+
+#define LOCAL_PORT 8888
+#define SEL_TRX1 0x01
+#define SEL_TRX2 0x02
+#define MAX_EVENTS 256 // イベントキューの最大サイズ
+#define SAME_MAX 4     // ON OFFの連続同一信号の場合の動作省略しきい値 指定回数目から削除
+#define MAX_ON_DURATION 3000
+#define MAX_FUTURE_WAIT 2000
+
+#define GPIO_SET(pin) GPIO.out_w1ts = (1 << pin)
+#define GPIO_CLR(pin) GPIO.out_w1tc = (1 << pin)
+
+WiFiUDP Udp;
+const int NUMPIXELS = 1;
+Adafruit_NeoPixel pixels(NUMPIXELS, LED_PIN, NEO_GRB + NEO_KHZ800);
+
+byte pkt[3];
+int packetSize = 0;
+unsigned long lastPacketTime = 0;
+unsigned long lastPingTime = 0;
+unsigned long lastOnTimeTx1 = 0;
+unsigned long lastOnTimeTx2 = 0;
+unsigned long lastBlinkTime = 0;
+bool ledState = false;
+bool lastStateTx1 = false;
+bool lastStateTx2 = false;
+byte lastTrxSel = 0x00;
+byte lastSeqNum = 0xFF;
+bool isReady = false;
+bool serverAlive = true;
+unsigned long dynamicTimeout = 12000;
+unsigned long profileSelectStart = 0;
+const unsigned long PROFILE_SELECT_WINDOW = 10000; // 10秒
+bool profileSelected = false;
+int selectedProfileIndex = 0;
+
+const unsigned long MIN_EVENT_INTERVAL = 40; // ms単位での最小登録間隔
+
+struct CWEvent
+{
+  bool isOn;
+  byte trxSel;
+  uint64_t opTimeMs;
+};
+
+CWEvent eventQueue[MAX_EVENTS];
+uint16_t queueHead = 0;
+uint16_t queueTail = 0;
+
+bool connectServerProfile();
+void initLed();
+void clearLed();
+void setLedFromProfileIndex(int index);
+void setLedColor(uint8_t r, uint8_t g, uint8_t b);
+void setLedColorFromProfile(ColorProfile *color);
+void flashLedProfile(ColorProfile *color, int durationMs, int repeat);
+void flashOnce(ColorProfile *color, int durationMs);
+void saveProfileIndexToEEPROM(int index);
+int loadProfileIndexFromEEPROM();
+bool loadWiFiProfilesFromSD();
+void saveWiFiProfileToEEPROM(const WiFiProfile &src, int index);
+bool loadWiFiProfileFromEEPROM(WiFiProfile &dst, int index);
+void clearEEPROM();
+bool restoreProfilesFromEEPROM();
+
+void setup()
+{
+  Serial.begin(115200);
+  EEPROM.begin(EEPROM_SIZE);
+
+#ifdef LoadFromSource
+  profileCount = sizeof(defaultProfiles) / sizeof(WiFiProfile);
+  for (int i = 0; i < profileCount && i < MAX_WIFI_PROFILES; i++)
+  {
+    wifiProfiles[i] = defaultProfiles[i];
+  }
+#endif
+  auto cfg = M5.config();
+  cfg.external_spk = false; // 外部スピーカー無効
+  cfg.internal_mic = false; // 内蔵マイク無効
+  cfg.output_power = false; // 電源制御ピン無効
+  cfg.clear_display = true; // 画面初期化あり（必要に応じて）
+  M5.begin(cfg);
+
+#ifdef LoadFromSource
+#else
+  bool sdAvailable = false;
+  delay(100);
+  pinMode(SD_SPI_MISO_PIN, INPUT_PULLDOWN);
+  bool isSetupMode = digitalRead(SD_SPI_MISO_PIN);
+
+  delay(500);
+
+  if (isSetupMode)
+  {
+    SPI.begin(SD_SPI_SCK_PIN, SD_SPI_MISO_PIN, SD_SPI_MOSI_PIN, SD_SPI_CS_PIN);
+
+    if (SD.begin(SD_SPI_CS_PIN) && SD.exists(SD_Filename))
+    {
+      // Serial.println("SDカード初期化成功！");
+      if (loadWiFiProfilesFromSD())
+      {
+        clearEEPROM();
+        for (int i = 0; i < profileCount; i++)
+        {
+          saveWiFiProfileToEEPROM(wifiProfiles[i], i);
+        }
+        saveProfileIndexToEEPROM(0);
+        delay(100);
+
+        // ✅ 成功通知：青ランプ点灯
+        initLed();
+        flashLedProfile(&BlueProfile, 2000, 1);
+
+        while (true)
+          delay(100);
+      }
+      else
+      {
+        // ❌️ 失敗通知：赤ランプ点灯
+        initLed();
+        flashLedProfile(&RedProfile, 2000, 1);
+
+        while (true)
+          delay(100);
+      }
+    }
+    else
+    {
+      // Serial.println("SDカードが見つからないか、設定ファイルがありません。EEPROMから復元します。");
+    }
+    // Serial.println("通常モード。EEPROMから復元します。");
+  }
+  selectedProfileIndex = loadProfileIndexFromEEPROM();
+  activeProfileIndex = selectedProfileIndex;
+
+  // ✅ EEPROMからプロファイルを復元
+  if (!restoreProfilesFromEEPROM())
+  {
+
+    initLed();
+    while (true)
+    {
+      flashOnce(&RedProfile, 300);
+      delay(300);
+    }
+  }
+#endif
+
+  selectedProfileIndex = loadProfileIndexFromEEPROM();
+  activeProfileIndex = selectedProfileIndex;
+
+  if (selectedProfileIndex >= profileCount)
+  {
+    selectedProfileIndex = 0;
+  }
+  activeProfileIndex = selectedProfileIndex;
+
+  if (selectedProfileIndex >= profileCount)
+  {
+    // Serial.println("⚠️ EEPROMのプロファイルインデックスが無効です。0にリセットします");
+    selectedProfileIndex = 0;
+  }
+
+  activeProfileIndex = selectedProfileIndex;
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+  initLed();
+  profileSelectStart = millis();
+
+  setLedFromProfileIndex(selectedProfileIndex);
+
+  // 10秒間だけ選択可能
+  while (millis() - profileSelectStart < PROFILE_SELECT_WINDOW)
+  {
+    M5.update();
+    static bool lastButtonState = HIGH;
+    bool buttonState = digitalRead(BUTTON_PIN);
+    if (M5.BtnA.wasPressed())
+    {
+      selectedProfileIndex = (selectedProfileIndex + 1) % profileCount;
+      setLedFromProfileIndex(selectedProfileIndex);
+      // Serial.printf("🔄 プロファイル切替: %d (%s)\n", selectedProfileIndex, wifiProfiles[selectedProfileIndex].ssid);
+    }
+    lastButtonState = buttonState;
+    delay(100);
+  }
+  activeProfileIndex = selectedProfileIndex;
+  setLedFromProfileIndex(activeProfileIndex);
+  gpio_pad_select_gpio((gpio_num_t)BUTTON_PIN);
+  gpio_set_direction((gpio_num_t)BUTTON_PIN, GPIO_MODE_DISABLE);
+
+  saveProfileIndexToEEPROM(selectedProfileIndex);
+  EEPROM.end();
+  delay(100);
+
+  pinMode(keyPinTx1, OUTPUT);
+  //  pinMode(keyPinTx2, OUTPUT);
+  GPIO_CLR(keyPinTx1);
+  //  GPIO_CLR(keyPinTx2);
+
+  if (connectServerProfile())
+  {
+    // ✅ WiFi接続成功後にmDNSを開始！
+    if (MDNS.begin(wifiProfiles[activeProfileIndex].hostname))
+    {
+      // Serial.println("✅ mDNS開始成功");
+      // Serial.print("📡 サーバーIP: ");
+      // Serial.println(WiFi.localIP());
+      Udp.begin(LOCAL_PORT);
+      lastPacketTime = millis();
+      lastPingTime = millis();
+
+      int rssi = WiFi.RSSI();
+      dynamicTimeout = constrain(map(rssi, -90, -30, 12000, 4000), 4000, 12000);
+    }
+    else
+    {
+      // Serial.println("❌ mDNS開始失敗");
+    }
+  }
+}
+
+void loop()
+{
+  unsigned long now = millis();
+
+  packetSize = Udp.parsePacket();
+
+  if (packetSize == 5)
+  {
+    byte buf[5];
+    Udp.read(buf, 5);
+    // delay(10);
+    //  Serial.printf("📩 SYNCリクエスト受信: buf[0]=0x%02X\n", buf[0]);
+    if (buf[0] == 0xE0)
+    {
+      unsigned long serverRecvMs = now;
+      byte reply[9] = {0xE1};
+      for (int i = 0; i < 4; i++)
+        reply[1 + i] = 0x00;
+      for (int i = 0; i < 4; i++)
+        reply[5 + i] = (serverRecvMs >> (24 - i * 8)) & 0xFF;
+      Udp.beginPacket(Udp.remoteIP(), Udp.remotePort());
+      Udp.write(reply, 9);
+      Udp.endPacket();
+      isReady = true;
+      serverAlive = true;
+    }
+  }
+
+  while (queueHead != queueTail && now >= eventQueue[queueHead].opTimeMs)
+  {
+    CWEvent &ev = eventQueue[queueHead];
+
+    if (ev.trxSel != lastTrxSel)
+    {
+      if (lastStateTx1)
+        GPIO_CLR(keyPinTx1);
+      if (lastStateTx2)
+        GPIO_CLR(keyPinTx2);
+      lastStateTx1 = false;
+      lastStateTx2 = false;
+    }
+
+    if (ev.trxSel == SEL_TRX1 && ev.isOn != lastStateTx1)
+    {
+      ev.isOn ? GPIO_SET(keyPinTx1) : GPIO_CLR(keyPinTx1);
+      lastStateTx1 = ev.isOn;
+      lastOnTimeTx1 = ev.isOn ? now : lastOnTimeTx1;
+    }
+
+    if (ev.trxSel == SEL_TRX2 && ev.isOn != lastStateTx2)
+    {
+      ev.isOn ? GPIO_SET(keyPinTx2) : GPIO_CLR(keyPinTx2);
+      lastStateTx2 = ev.isOn;
+      lastOnTimeTx2 = ev.isOn ? now : lastOnTimeTx2;
+    }
+
+    lastTrxSel = ev.trxSel;
+    queueHead = (queueHead + 1) % MAX_EVENTS;
+  }
+
+  if (packetSize == 10)
+  {
+    byte buf[10];
+    Udp.read(buf, 10);
+    CWEvent ev;
+    ev.isOn = buf[0] & 0x01;
+    ev.trxSel = buf[1];
+    ev.opTimeMs = 0;
+    for (int i = 0; i < 8; i++)
+      ev.opTimeMs = (ev.opTimeMs << 8) | buf[2 + i];
+
+    if (ev.opTimeMs > now + MAX_FUTURE_WAIT)
+    {
+    }
+
+    bool shouldSave = true;
+    int sameCount = 0;
+    for (int i = 1; i <= SAME_MAX; ++i)
+    { // 最大5つ前までチェック（必要に応じて調整）
+      if ((queueTail + MAX_EVENTS - i) % MAX_EVENTS == queueHead)
+        break;
+      CWEvent &prev = eventQueue[(queueTail + MAX_EVENTS - i) % MAX_EVENTS];
+      if (ev.isOn == prev.isOn &&
+          ev.trxSel == prev.trxSel &&
+          abs((long)(ev.opTimeMs - prev.opTimeMs)) < MIN_EVENT_INTERVAL * (i + 1))
+      {
+        sameCount++;
+      }
+      else
+      {
+        break;
+      }
+    }
+    if (sameCount >= SAME_MAX - 1)
+    { // 直前に5つ以上同じ → 今回で6つ目以降 → スキップ
+      shouldSave = false;
+    }
+
+    if (shouldSave)
+    {
+      uint16_t nextTail = (queueTail + 1) % MAX_EVENTS;
+      if (nextTail != queueHead)
+      {
+        uint16_t insertPos = queueTail;
+        for (uint16_t i = queueHead; i != queueTail; i = (i + 1) % MAX_EVENTS)
+        {
+          if (ev.opTimeMs < eventQueue[i].opTimeMs)
+          {
+            insertPos = i;
+            break;
+          }
+        }
+        if (insertPos != queueTail)
+        {
+          for (uint16_t i = queueTail; i != insertPos; i = (i == 0 ? MAX_EVENTS - 1 : i - 1))
+          {
+            uint16_t prev = (i == 0 ? MAX_EVENTS - 1 : i - 1);
+            eventQueue[i] = eventQueue[prev];
+          }
+        }
+        eventQueue[insertPos] = ev;
+        queueTail = nextTail;
+      }
+    }
+
+    lastPacketTime = now;
+    lastPingTime = now;
+    serverAlive = true;
+  }
+
+  else if (packetSize == 13)
+  {
+    byte buf[13];
+    Udp.read(buf, 13);
+    byte trxSel = buf[0];
+    byte keyBits = buf[1];
+    unsigned long baseTime = ((unsigned long)buf[2] << 16) |
+                             ((unsigned long)buf[3] << 8) |
+                             (unsigned long)buf[4];
+
+    for (int i = 0; i < 8; i++)
+    {
+      bool isOn = (keyBits >> (7 - i)) & 0x01;
+      unsigned long opTimeMs = baseTime + buf[5 + i];
+
+      if (millis() > opTimeMs + 20)
+        continue;
+
+      // --- イベントの重複排除ロジック ---
+      uint16_t insertPos = queueTail;
+      for (uint16_t j = queueHead; j != queueTail; j = (j + 1) % MAX_EVENTS)
+      {
+        if (opTimeMs < eventQueue[j].opTimeMs)
+        {
+          insertPos = j;
+          break;
+        }
+      }
+
+      uint16_t prevIndex = (insertPos == 0) ? (MAX_EVENTS - 1) : (insertPos - 1);
+      CWEvent &prev = eventQueue[prevIndex];
+      bool stateChanged = (isOn != prev.isOn || trxSel != prev.trxSel);
+      bool timeSeparated = abs((long)(opTimeMs - prev.opTimeMs)) >= MIN_EVENT_INTERVAL;
+      // --- 重複排除（特定数以上信号が連続ならスキップ） ---
+      int sameCount = 0;
+      for (int j = 1; j <= SAME_MAX; ++j)
+      {
+        if ((queueTail + MAX_EVENTS - j) % MAX_EVENTS == queueHead)
+          break;
+        CWEvent &prev = eventQueue[(queueTail + MAX_EVENTS - j) % MAX_EVENTS];
+        if (isOn == prev.isOn &&
+            trxSel == prev.trxSel &&
+            abs((long)(opTimeMs - prev.opTimeMs)) < MIN_EVENT_INTERVAL * (j + 1))
+        {
+          sameCount++;
+        }
+        else
+        {
+          break;
+        }
+      }
+      if (sameCount >= SAME_MAX - 1)
+        continue; // 特定数以上信号が連続した場合 → スキップ
+
+      CWEvent ev = {isOn, trxSel, opTimeMs};
+      uint16_t nextTail = (queueTail + 1) % MAX_EVENTS;
+      if (nextTail != queueHead)
+      {
+        uint16_t insertPos = queueTail;
+        for (uint16_t i = queueHead; i != queueTail; i = (i + 1) % MAX_EVENTS)
+        {
+          if (ev.opTimeMs < eventQueue[i].opTimeMs)
+          {
+            insertPos = i;
+            break;
+          }
+        }
+        if (insertPos != queueTail)
+        {
+          for (uint16_t i = queueTail; i != insertPos; i = (i == 0 ? MAX_EVENTS - 1 : i - 1))
+          {
+            uint16_t prev = (i == 0 ? MAX_EVENTS - 1 : i - 1);
+            eventQueue[i] = eventQueue[prev];
+          }
+        }
+        eventQueue[insertPos] = ev;
+        queueTail = nextTail;
+      }
+
+      lastTrxSel = trxSel;
+      if (trxSel == SEL_TRX1)
+        lastStateTx1 = isOn;
+      if (trxSel == SEL_TRX2)
+        lastStateTx2 = isOn;
+    }
+
+    lastPacketTime = millis();
+    lastPingTime = millis();
+    serverAlive = true;
+  }
+
+  else if (packetSize == 3)
+  {
+    Udp.read(pkt, 3);
+    bool isOn = pkt[0] & 0x01;
+    byte trxSel = pkt[1];
+    byte seq = pkt[2];
+    if (seq == lastSeqNum)
+      return;
+    lastSeqNum = seq;
+
+    if (trxSel != lastTrxSel)
+    {
+      if (lastStateTx1)
+        // digitalWrite(keyPinTx1, LOW);
+        GPIO_CLR(keyPinTx1);
+      if (lastStateTx2)
+        // digitalWrite(keyPinTx2, LOW);
+        GPIO_CLR(keyPinTx2);
+      lastStateTx1 = false;
+      lastStateTx2 = false;
+    }
+
+    if (trxSel == SEL_TRX1 && isOn != lastStateTx1)
+    {
+      // digitalWrite(keyPinTx1, isOn ? HIGH : LOW);
+      isOn ? GPIO_SET(keyPinTx1) : GPIO_CLR(keyPinTx1);
+
+      lastStateTx1 = isOn;
+      lastOnTimeTx1 = isOn ? now : lastOnTimeTx1;
+    }
+
+    if (trxSel == SEL_TRX2 && isOn != lastStateTx2)
+    {
+      // digitalWrite(keyPinTx2, isOn ? HIGH : LOW);
+      isOn ? GPIO_SET(keyPinTx2) : GPIO_CLR(keyPinTx2);
+      lastStateTx2 = isOn;
+      lastOnTimeTx2 = isOn ? now : lastOnTimeTx2;
+    }
+
+    lastTrxSel = trxSel;
+    lastPacketTime = now;
+    lastPingTime = now;
+    serverAlive = true;
+
+    byte ack[2] = {0xA0, seq};
+    Udp.beginPacket(Udp.remoteIP(), Udp.remotePort());
+    Udp.write(ack, 2);
+    Udp.endPacket();
+  }
+
+  else if (packetSize == 1)
+  {
+    byte ping;
+    Udp.read(&ping, 1);
+    if (ping == 0xFF)
+    {
+      byte reply = 0xFE;
+      Udp.beginPacket(Udp.remoteIP(), Udp.remotePort());
+      Udp.write(&reply, 1);
+      Udp.endPacket();
+      lastPingTime = now;
+      serverAlive = true;
+    }
+  }
+
+  else if (packetSize == 4)
+  {
+    byte buf[4];
+    Udp.read(buf, 4);
+    lastPacketTime = now;
+  }
+
+  // ==== TRX ON安全対策（ONが長すぎる場合は強制OFF） ====
+  if (lastStateTx1 && now - lastOnTimeTx1 > MAX_ON_DURATION)
+  {
+    // digitalWrite(keyPinTx1, LOW);
+    GPIO_CLR(keyPinTx1);
+    lastStateTx1 = false;
+  }
+  if (lastStateTx2 && now - lastOnTimeTx2 > MAX_ON_DURATION)
+  {
+    // digitalWrite(keyPinTx2, LOW);
+    GPIO_CLR(keyPinTx2);
+    lastStateTx2 = false;
+  }
+
+  // ==== 通信タイムアウト処理 ====
+  if (now - lastPacketTime >= dynamicTimeout)
+  {
+    if (lastStateTx1)
+      // digitalWrite(keyPinTx1, LOW);
+      GPIO_CLR(keyPinTx1);
+    if (lastStateTx2)
+      // digitalWrite(keyPinTx2, LOW);
+      GPIO_CLR(keyPinTx2);
+    lastStateTx1 = false;
+    lastStateTx2 = false;
+    isReady = false;
+    serverAlive = false;
+  }
+
+  // ==== SYNC完了LED点滅処理 ====
+  if (isReady && serverAlive)
+  {
+    if (now - lastBlinkTime >= 500)
+    {
+      ledState = !ledState;
+
+      if (ledState)
+      {
+        setLedColorFromProfile(&BlueProfile);
+      }
+      else
+      {
+        setLedColorFromProfile(&RedProfile);
+      }
+      pixels.show();
+      lastBlinkTime = now;
+    }
+  }
+  else if (!serverAlive)
+  {
+    setLedColorFromProfile(&RedProfile);
+  }
+  else
+  {
+    setLedColorFromProfile(&GreenProfile);
+  }
+
+  // ==== 処理間隔調整 ====
+  if (queueHead == queueTail)
+    delay(1);
+
+  int queueUsage = (queueTail - queueHead + MAX_EVENTS) % MAX_EVENTS;
+  if (queueUsage > MAX_EVENTS * 0.8)
+  {
+    // Serial.printf("⚠️ Queue usage high: %d/%d\n", queueUsage, MAX_EVENTS);
+  }
+}
+
+// ==== WiFi接続関数（複数プロファイル対応） ====
+bool connectServerProfile()
+{
+  WiFiProfile &profile = wifiProfiles[activeProfileIndex];
+
+  if (!profile.isApMode && profile.hostname && strlen(profile.hostname) > 0)
+  {
+    WiFi.setHostname(profile.hostname);
+  }
+  if (profile.isApMode)
+  {
+    WiFi.disconnect(true);
+    WiFi.mode(WIFI_AP);
+    WiFi.softAPConfig(profile.localIP, profile.gateway, profile.subnet);
+    WiFi.softAP(profile.ssid, profile.password);
+    WiFi.setTxPower(WIFI_POWER_19_5dBm);
+    // Serial.printf("📡 APモード開始: SSID=%s, IP=%s\n", profile.ssid, profile.localIP.toString().c_str());
+
+    esp_wifi_set_ps(WIFI_PS_NONE);
+    // クライアント接続待ち（最大30秒）
+    unsigned long startWait = millis();
+    while (millis() - startWait < 30000)
+    {
+      int clients = WiFi.softAPgetStationNum();
+      if (clients > 0)
+      {
+        // Serial.printf("✅ クライアント接続確認: %d台\n", clients);
+        setLedColor(profile.color->r, profile.color->g, profile.color->b);
+        return true;
+      }
+      delay(500);
+    }
+
+    // Serial.println("⚠️ クライアント接続なし（タイムアウト）");
+  }
+  else
+  {
+    WiFi.mode(WIFI_STA);
+    if (profile.hasIP)
+    {
+      WiFi.config(profile.localIP, profile.gateway, profile.subnet);
+    }
+    WiFi.begin(profile.ssid, profile.password);
+
+    for (int t = 0; t < 60; t++) // 最大30秒待つ
+    {
+      if (WiFi.status() == WL_CONNECTED)
+      {
+
+        esp_wifi_set_ps(WIFI_PS_NONE);
+        setLedColor(profile.color->r, profile.color->g, profile.color->b);
+        // Serial.printf("✅ 接続成功: SSID=%s, IP=%s\n", profile.ssid, WiFi.localIP().toString().c_str());
+        return true;
+      }
+      delay(500);
+    }
+
+    // Serial.printf("❌ 接続失敗: SSID=%s\n", profile.ssid);
+  }
+
+  return false;
+}
+
+void setLedColor(uint8_t r, uint8_t g, uint8_t b)
+{
+  pixels.setPixelColor(0, pixels.Color(r, g, b));
+  pixels.show();
+}
+
+void saveProfileIndexToEEPROM(int index)
+{
+  EEPROM.write(EEPROM_ADDR_PROFILE_INDEX, index);
+  EEPROM.commit();
+}
+
+int loadProfileIndexFromEEPROM()
+{
+  byte val = EEPROM.read(EEPROM_ADDR_PROFILE_INDEX);
+  if (val < profileCount)
+    return val;
+  return 0; // デフォルト
+}
+
+bool loadWiFiProfilesFromSD()
+{
+  File file = SD.open(SD_Filename);
+  if (!file)
+    return false;
+
+  WiFiProfile temp;
+  ColorProfile *color = &cyanProfile;
+  profileCount = 0;
+  bool hasData = false; // ← 追加！
+
+  while (file.available())
+  {
+    String line = file.readStringUntil('\n');
+    line.trim();
+
+    if (line.length() == 0 || line.startsWith("#"))
+      continue;
+
+    if (line.startsWith("[Profile]"))
+    {
+      if (hasData && temp.ssid && strlen(temp.ssid) > 0 && temp.password && strlen(temp.password) > 0 && profileCount < MAX_WIFI_PROFILES)
+      {
+        wifiProfiles[profileCount] = temp;
+        temp.color = color;
+        wifiProfiles[profileCount].color = color;
+        /*Serial.printf("✅ プロファイル[%d] 読み込み: SSID=%s, MODE=%s, COLOR=%s\n",
+                      profileCount,
+                      temp.ssid,
+                      temp.isApMode ? "AP" : "STA",
+                      color->name);*/
+
+        profileCount++;
+      }
+      else if (hasData)
+      {
+        // Serial.println("⚠️ 無効なプロファイル（SSIDまたはPASSなし）をスキップしました");
+      }
+
+      temp = WiFiProfile();
+      color = &cyanProfile;
+      hasData = false;
+    }
+    else if (line.startsWith("SSID="))
+    {
+      temp.ssid = strdup(line.substring(5).c_str());
+      hasData = true;
+    }
+    else if (line.startsWith("PASS="))
+    {
+      temp.password = strdup(line.substring(5).c_str());
+      hasData = true;
+    }
+    else if (line.startsWith("IP="))
+      temp.localIP.fromString(line.substring(3));
+    else if (line.startsWith("GW="))
+      temp.gateway.fromString(line.substring(3));
+    else if (line.startsWith("MASK="))
+      temp.subnet.fromString(line.substring(5));
+    else if (line.startsWith("HASIP="))
+    {
+      String val = line.substring(6);
+      val.trim();
+      temp.hasIP = (val == "IP");
+    }
+    else if (line.startsWith("MODE="))
+    {
+      String val = line.substring(5);
+      val.trim();
+      temp.isApMode = (val == "AP");
+    }
+    else if (line.startsWith("COLOR="))
+    {
+      String c = line.substring(6);
+      if (c == "Magenta")
+        color = &MagentaProfile;
+      else if (c == "Yellow")
+        color = &yellowProfile;
+      else if (c == "Cyan")
+        color = &cyanProfile;
+      else if (c == "Red")
+        color = &RedProfile;
+      else if (c == "Blue")
+        color = &BlueProfile;
+      else if (c == "Green")
+        color = &GreenProfile;
+      else if (c == "White")
+        color = &WhiteProfile;
+    }
+    else if (line.startsWith("HOSTNAME="))
+    {
+      temp.hostname = strdup(line.substring(9).c_str());
+    }
+  }
+
+  // 最後のプロファイルを保存
+  if (hasData && temp.ssid && strlen(temp.ssid) > 0 && temp.password && strlen(temp.password) > 0 && profileCount < MAX_WIFI_PROFILES)
+  {
+    wifiProfiles[profileCount] = temp;
+    wifiProfiles[profileCount].color = color;
+    /*Serial.printf("✅ プロファイル[%d] 読み込み: SSID=%s, MODE=%s, COLOR=%s\n",
+                  profileCount,
+                  temp.ssid,
+                  temp.isApMode ? "AP" : "STA",
+                  color->name);*/
+
+    profileCount++;
+  }
+  else if (hasData)
+  {
+    // Serial.println("⚠️ 最後のプロファイルが無効（SSIDまたはPASSなし）だったためスキップしました");
+  }
+
+  file.close();
+  // Serial.printf("📦 SDから読み込んだプロファイル数: %d\n", profileCount);
+  return profileCount > 0;
+}
+
+void saveWiFiProfileToEEPROM(const WiFiProfile &src, int index)
+{
+  if (!src.ssid || strlen(src.ssid) == 0 || !src.password || strlen(src.password) == 0)
+  {
+    // Serial.printf("❌ saveWiFiProfileToEEPROM: 無効なプロファイル（index=%d）をスキップします\n", index);
+    return;
+  }
+
+  WiFiProfileEEPROM dst;
+  memset(&dst, 0, sizeof(dst));
+  dst.magic = PROFILE_MAGIC;
+  strncpy(dst.ssid, src.ssid, MAX_SSID_LEN);
+  strncpy(dst.password, src.password, MAX_PASS_LEN);
+  strncpy(dst.hostname, src.hostname, MAX_HOSTNAME_LEN);
+
+  for (int i = 0; i < 4; i++)
+  {
+    dst.localIP[i] = src.localIP[i];
+    dst.gateway[i] = src.gateway[i];
+    dst.subnet[i] = src.subnet[i];
+  }
+  dst.hasIP = src.hasIP;
+  dst.isApMode = src.isApMode;
+  if (src.color == &cyanProfile)
+    dst.colorId = 0;
+  else if (src.color == &MagentaProfile)
+    dst.colorId = 1;
+  else if (src.color == &yellowProfile)
+    dst.colorId = 2;
+  else if (src.color == &RedProfile)
+    dst.colorId = 3;
+  else if (src.color == &BlueProfile)
+    dst.colorId = 4;
+  else if (src.color == &GreenProfile)
+    dst.colorId = 5;
+  else if (src.color == &WhiteProfile)
+    dst.colorId = 6;
+  else
+    dst.colorId = 0;
+
+  int addr = EEPROM_ADDR_PROFILE_BASE + index * sizeof(WiFiProfileEEPROM);
+  // Serial.printf("💾 書き込み index=%d, addr=%d, SSID=%s\n", index, addr, src.ssid);
+  EEPROM.put(addr, dst);
+  EEPROM.commit();
+}
+
+bool loadWiFiProfileFromEEPROM(WiFiProfile &dst, int index)
+{
+  WiFiProfileEEPROM raw;
+  int addr = EEPROM_ADDR_PROFILE_BASE + index * sizeof(WiFiProfileEEPROM);
+  EEPROM.get(addr, raw);
+
+  // Serial.printf("📖 読み込み index=%d, addr=%d, magic=0x%02X\n", index, addr, raw.magic);
+
+  if (raw.magic != PROFILE_MAGIC)
+  {
+    // Serial.printf("❌ 無効なプロファイル index=%d（magic=0x%02X）\n", index, raw.magic);
+    return false; // ← if の中に入れる！
+  }
+
+  dst.ssid = strdup(raw.ssid);
+  dst.password = strdup(raw.password);
+  dst.localIP = IPAddress(raw.localIP);
+  dst.gateway = IPAddress(raw.gateway);
+  dst.subnet = IPAddress(raw.subnet);
+  dst.hasIP = raw.hasIP;
+  dst.isApMode = raw.isApMode;
+  dst.hostname = strdup(raw.hostname);
+
+  switch (raw.colorId)
+  {
+  case 0:
+    dst.color = &cyanProfile;
+    break;
+  case 1:
+    dst.color = &MagentaProfile;
+    break;
+  case 2:
+    dst.color = &yellowProfile;
+    break;
+  case 3:
+    dst.color = &RedProfile;
+    break;
+  case 4:
+    dst.color = &BlueProfile;
+    break;
+  case 5:
+    dst.color = &GreenProfile;
+    break;
+  case 6:
+    dst.color = &WhiteProfile;
+    break;
+  default:
+    // Serial.printf("⚠️ EEPROMの colorId=%d は不正です。Red にフォールバックします\n", raw.colorId);
+    dst.color = &RedProfile;
+    break;
+  }
+
+  // Serial.printf("📘 hasIP=%d, isApMode=%d\n", raw.hasIP, raw.isApMode);
+  return true;
+}
+
+void clearEEPROM()
+{
+  for (int i = 0; i < EEPROM_SIZE; i++)
+    EEPROM.write(i, 0xFF);
+  EEPROM.commit();
+  delay(100);
+}
+
+bool restoreProfilesFromEEPROM()
+{
+  profileCount = 0;
+  for (int i = 0; i < MAX_WIFI_PROFILES; i++)
+  {
+    if (loadWiFiProfileFromEEPROM(wifiProfiles[i], i))
+    {
+      profileCount++;
+      // Serial.printf("✅ EEPROMからプロファイル[%d] を復元: SSID=%s\n", i, wifiProfiles[i].ssid);
+    }
+  }
+  // Serial.printf("📊 復元されたプロファイル数: %d\n", profileCount);
+  return profileCount > 0;
+}
+
+void setLedColorFromProfile(ColorProfile *color)
+{
+  if (!color)
+    return;
+  setLedColor(color->r, color->g, color->b);
+}
+
+void flashLedProfile(ColorProfile *color, int durationMs = 200, int repeat = 1)
+{
+  if (!color)
+    return;
+  for (int i = 0; i < repeat; i++)
+  {
+    setLedColorFromProfile(color);
+    delay(durationMs);
+    setLedColor(0, 0, 0); // 消灯
+    delay(durationMs);
+  }
+}
+
+void flashOnce(ColorProfile *color, int durationMs)
+{
+  if (!color)
+    return;
+  setLedColorFromProfile(color);
+  delay(durationMs);
+  setLedColor(0, 0, 0); // 消灯
+}
+
+void initLed()
+{
+  pixels.begin();
+  pixels.setBrightness(50);
+}
+
+void setLedFromProfileIndex(int index)
+{
+  if (index >= 0 && index < profileCount)
+    setLedColorFromProfile(wifiProfiles[index].color);
+}
+
+void clearLed()
+{
+  pixels.clear();
+  pixels.show();
+}
