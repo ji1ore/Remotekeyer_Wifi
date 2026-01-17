@@ -139,15 +139,14 @@ const int RTT_THRESH_6 = 100;
 const int RTT_THRESH_7 = 200;
 
 // ping返送時間間隔ごとの遅延時間定義(msec)
-const int DELAY_VERY_LOW = 50;   // RTT_THRESH_1以下
-const int DELAY_LOW = 50;        // RTT_THRESH_2以下
-const int DELAY_MID = 50;        // RTT_THRESH_3以下
-const int DELAY_HIGH = 50;       // RTT_THRESH_4以下
-const int DELAY_VERY_HIGH = 100;  // RTT_THRESH_5以下
+const int DELAY_VERY_LOW = 100;   // RTT_THRESH_1以下
+const int DELAY_LOW = 100;        // RTT_THRESH_2以下
+const int DELAY_MID = 100;        // RTT_THRESH_3以下
+const int DELAY_HIGH = 100;       // RTT_THRESH_4以下
+const int DELAY_VERY_HIGH = 125;  // RTT_THRESH_5以下
 const int DELAY_VERY2_HIGH = 150; // RTT_THRESH_6以下
-const int DELAY_VERY3_HIGH = 200; // RTT_THRESH_7以下
+const int DELAY_VERY3_HIGH = 250; // RTT_THRESH_7以下
 const int DELAY_MAX = 500;        // RTT_THRESH_7超
-
 
 const unsigned long BLINK_INTERVAL_WIFI = 1000;
 const unsigned long BLINK_INTERVAL_SYNC = 300;
