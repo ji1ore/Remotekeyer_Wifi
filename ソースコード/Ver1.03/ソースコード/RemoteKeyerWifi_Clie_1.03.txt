@@ -119,11 +119,11 @@ Adafruit_NeoPixel pixels(NUMPIXELS, LED_PIN, NEO_GRB + NEO_KHZ800);
 unsigned long MAX_ON_DURATION = 3000;
 const int PING_INTERVAL = 5000;
 const int ReCal_RTT = 5000;
-int keyRepeatCount = 5;                // 即時変化パケットの重複送付回数
-const int SAMPLE_SEND_DUP_CNT = 1;      // サンプリングパケットの重複送付回数
-const int SAMPLE_INTERVAL_MS = 10;      // サンプリングの周期(msec)
-const int SAMPLE_SEND_AMNT = 8;         // サンプリングパケットの送付サイズ(変更時は送付パケットの修正が必要)
-const int SAMPLE_SUPPRESS_MS = 10;      // 即時送信後にサンプリングを抑制する時間
+int keyRepeatCount = 10;           // 即時変化パケットの重複送付回数
+const int SAMPLE_SEND_DUP_CNT = 1; // サンプリングパケットの重複送付回数
+const int SAMPLE_INTERVAL_MS = 10; // サンプリングの周期(msec)
+const int SAMPLE_SEND_AMNT = 8;    // サンプリングパケットの送付サイズ(変更時は送付パケットの修正が必要)
+// const int SAMPLE_SUPPRESS_MS = 10;      // 即時送信後にサンプリングを抑制する時間
 const unsigned long DEBOUNCE_US = 5000; // 割り込み処理
 volatile unsigned long lastKeyChangeMicros = 0;
 const int HOSTNAME_RESTIME = 30; // 名前解決の待機時間
@@ -143,7 +143,7 @@ const int DELAY_VERY_LOW = 100;   // RTT_THRESH_1以下
 const int DELAY_LOW = 100;        // RTT_THRESH_2以下
 const int DELAY_MID = 100;        // RTT_THRESH_3以下
 const int DELAY_HIGH = 100;       // RTT_THRESH_4以下
-const int DELAY_VERY_HIGH = 125;  // RTT_THRESH_5以下
+const int DELAY_VERY_HIGH = 150;  // RTT_THRESH_5以下
 const int DELAY_VERY2_HIGH = 150; // RTT_THRESH_6以下
 const int DELAY_VERY3_HIGH = 250; // RTT_THRESH_7以下
 const int DELAY_MAX = 500;        // RTT_THRESH_7超
@@ -241,7 +241,8 @@ void keyISR(void *arg)
   if (now - lastIsrMicros < DEBOUNCE_US)
     return;
   lastIsrMicros = now;
-  keyState = (digitalRead(KEY_PIN) == LOW);
+  bool s = keyState = (digitalRead(KEY_PIN) == LOW);
+
   lastKeyChangeMicros = now; // ← 追加
   immediateSendRequested = true;
 }
@@ -279,6 +280,7 @@ void setup()
       {
         saveWiFiProfileToEEPROM(wifiProfiles[i], i);
       }
+      selectedProfileIndex = 0;
       saveProfileIndexToEEPROM(0);
       delay(100);
 
@@ -464,8 +466,8 @@ void loop()
   if (timeSynced && millis() - lastSampleTimeMs >= SAMPLE_INTERVAL_MS)
   {
     // 即時送信後は抑制
-    if (millis() - lastImmediateSendMillis < SAMPLE_SUPPRESS_MS)
-      return;
+    //    if (millis() - lastImmediateSendMillis < SAMPLE_SUPPRESS_MS)
+    //      return;
     // 即時送信中はサンプリング送信をスキップ
     if (immediateSendRequested)
       return;
@@ -935,7 +937,7 @@ bool loadWiFiProfilesFromSD()
   WiFiProfile temp;
   ColorProfile *color = &cyanProfile;
   profileCount = 0;
-  bool hasData = false; // ← 追加！
+  bool hasData = false; 
 
   while (file.available())
   {
