@@ -214,6 +214,7 @@ void setup()
         {
           saveWiFiProfileToEEPROM(wifiProfiles[i], i);
         }
+        selectedProfileIndex = 0;
         saveProfileIndexToEEPROM(0);
         delay(100);
 
